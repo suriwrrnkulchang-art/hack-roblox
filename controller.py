@@ -353,7 +353,7 @@ def get_state(place_id):
     if not secrets.compare_digest(supplied, expected):
         return jsonify({"error": "unauthorized"}), 401
     if place_id not in MAPS.values():
-        return jsonify({"error": "unknown place"}}, 404
+        return jsonify({"error": "unknown place"}), 404
     response = jsonify(snapshot(place_id))
     response.headers["Cache-Control"] = "no-store"
     return response
