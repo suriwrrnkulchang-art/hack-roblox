@@ -317,7 +317,6 @@ def api_update():
     return jsonify({"success": True})
 
 
-# เพิ่ม API สำหรับอัปเดตทุกแมพพร้อมกัน
 @app.post("/api/update-all")
 def api_update_all():
     req = request.json
@@ -337,7 +336,7 @@ def get_state(place_id):
     expected = "Bearer " + DATA["token"]
     supplied = request.headers.get("Authorization", "")
     if not secrets.compare_digest(supplied, expected):
-        return jsonify({"error": "unauthorized"}}, 401
+        return jsonify({"error": "unauthorized"}), 401
     if place_id not in MAPS.values():
         return jsonify({"error": "unknown place"}), 404
     response = jsonify(snapshot(place_id))
