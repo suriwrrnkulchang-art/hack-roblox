@@ -1,1 +1,1 @@
-web: python controller.py
+web: python3 controller.py
