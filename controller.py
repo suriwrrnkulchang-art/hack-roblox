@@ -93,10 +93,12 @@ def update_state(place_id, mode, reason=None, seconds=None):
     with LOCK:
         reconcile_locked()
         state = DATA["places"][place_id]
-        state["mode"] = mode
-        state["deadline"] = (
-            time.time() + seconds if mode == "scheduled" else None
-        )
+        if mode is not None:
+            state["mode"] = mode
+        if seconds is not None:
+            state["deadline"] = (
+                time.time() + seconds if state["mode"] == "scheduled" else None
+            )
         if reason is not None:
             state["reason"] = reason
         save_locked()
@@ -152,6 +154,9 @@ HTML_TEMPLATE = """
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; color: #7692ff; font-weight: bold; }
         select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
+        .reason-box { display: flex; gap: 10px; }
+        .reason-box input { flex: 1; }
+        .btn-save-reason { background: #0984e3; white-space: nowrap; padding: 0 15px; }
         .checkbox-group { display: flex; align-items: center; gap: 10px; margin: 15px 0; }
         .btn-container { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
         button { padding: 10px 18px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; color: #fff; font-size: 14px; flex: 1; min-width: 120px; }
@@ -180,7 +185,10 @@ HTML_TEMPLATE = """
         </div>
         <div class="form-group">
             <label>เหตุผล / ข้อความเตะ:</label>
-            <input type="text" id="reasonInput" value="เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง">
+            <div class="reason-box">
+                <input type="text" id="reasonInput" value="เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง">
+                <button type="button" class="btn-save-reason" onclick="saveReasonOnly()">💾 บันทึกข้อความ</button>
+            </div>
         </div>
         <div class="checkbox-group">
             <input type="checkbox" id="timerEnabled" checked onchange="toggleTimerInput()">
@@ -223,6 +231,23 @@ HTML_TEMPLATE = """
             const enabled = document.getElementById('timerEnabled').checked;
             document.getElementById('secondsGroup').style.display = enabled ? 'block' : 'none';
         }
+
+        async function saveReasonOnly() {
+            const pid = document.getElementById('mapSelect').value;
+            const reason = document.getElementById('reasonInput').value;
+
+            const res = await fetch('/api/save-reason', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({place_id: pid, reason: reason})
+            });
+            if(res.ok) {
+                alert('บันทึกข้อความ/เหตุผลสำเร็จ!');
+            } else {
+                alert('เกิดข้อผิดพลาดในการบันทึกข้อความ');
+            }
+        }
+
         async function sendAction(actionType) {
             const pid = document.getElementById('mapSelect').value;
             if(pid === 'ALL') {
@@ -317,6 +342,24 @@ def api_get_state(place_id):
     if place_id not in MAPS.values():
         return jsonify({"error": "unknown place"}), 404
     return jsonify(snapshot(place_id))
+
+
+@app.post("/api/save-reason")
+def api_save_reason():
+    req = request.json
+    pid = req.get("place_id")
+    reason = req.get("reason")
+    
+    if pid == "ALL":
+        for place_id in MAPS.values():
+            update_state(place_id, mode=None, reason=reason, seconds=None)
+        return jsonify({"success": True})
+        
+    if pid not in MAPS.values():
+        return jsonify({"error": "unknown place"}), 404
+        
+    update_state(pid, mode=None, reason=reason, seconds=None)
+    return jsonify({"success": True})
 
 
 @app.post("/api/update")
