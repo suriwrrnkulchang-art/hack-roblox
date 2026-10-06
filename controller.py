@@ -141,7 +141,6 @@ def update_state(place_id, mode=None, reason=None, seconds=None):
         reconcile_locked()
         state = DATA["places"][place_id]
         
-        # อัปเดตโหมดเฉพาะเมื่อมีการส่งค่ามา
         if mode is not None:
             state["mode"] = mode
             if mode == "scheduled" and seconds is not None:
@@ -149,7 +148,6 @@ def update_state(place_id, mode=None, reason=None, seconds=None):
             elif mode != "scheduled":
                 state["deadline"] = None
                 
-        # อัปเดตเหตุผลเมื่อมีการส่งค่ามา
         if reason is not None:
             state["reason"] = reason
             
@@ -205,11 +203,4 @@ HTML_TEMPLATE = """
         .logout-btn { font-size: 12px; background: #ff4d4d; padding: 5px 10px; border-radius: 4px; color: #fff; text-decoration: none; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; color: #7692ff; font-weight: bold; }
-        select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
-        .reason-box { display: flex; gap: 10px; }
-        .reason-box input { flex: 1; }
-        .btn-save-reason { background: #0984e3; white-space: nowrap; padding: 0 15px; cursor: pointer; border: none; border-radius: 6px; font-weight: bold; color: #fff; }
-        .btn-save-reason:hover { opacity: 0.9; }
-        .checkbox-group { display: flex; align-items: center; gap: 10px; margin: 15px 0; }
-        .btn-container { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
-        button { padding: 10px 18px; border: none; border-radius: 6
+        select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius:
