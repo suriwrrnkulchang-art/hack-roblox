@@ -18,9 +18,9 @@ from waitress import serve
 
 
 # ---------- ตั้งค่าระบบและความปลอดภัย ----------
-ADMIN_PASSWORD = "6155045"  # รหัสผ่านเข้าหน้าเว็บของคุณ
+ADMIN_PASSWORD = "6155045"
 
-# ---------- ตั้งค่าแมพ (ใช้ Place ID ทั้ง 2 แมพตามเดิม) ----------
+# ---------- ตั้งค่าแมพ ----------
 MAPS = {
     "Place 1": "120651982896178",
     "Place 2": "77210125175879",
@@ -58,7 +58,8 @@ def load_from_supabase():
                         places_data[pid] = {
                             "mode": row.get("mode", "open"),
                             "reason": row.get("reason", "เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง"),
-                            "deadline": row.get("deadline")
+                            "deadline": row.get("deadline"),
+                            "seconds": row.get("seconds", 60)
                         }
                 return {"token": token or secrets.token_urlsafe(32), "places": places_data}
     except Exception as e:
@@ -71,7 +72,8 @@ def save_to_supabase(place_id, state_data):
             "place_id": place_id,
             "mode": state_data.get("mode"),
             "reason": state_data.get("reason"),
-            "deadline": state_data.get("deadline")
+            "deadline": state_data.get("deadline"),
+            "seconds": state_data.get("seconds", 60)
         }
         url = f"{SUPABASE_URL}/rest/v1/control_state"
         req = urllib.request.Request(
@@ -85,7 +87,6 @@ def save_to_supabase(place_id, state_data):
     except Exception as e:
         print("Save error:", e)
 
-# โหลดข้อมูลเริ่มต้นจาก Supabase
 DATA = load_from_supabase()
 if not DATA or not DATA.get("places"):
     DATA = {
@@ -97,6 +98,7 @@ if not DATA or not DATA.get("places"):
             "mode": "open",
             "reason": "เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง",
             "deadline": None,
+            "seconds": 60,
         }
         save_to_supabase(place_id, DATA["places"][place_id])
     save_to_supabase("__SYS_TOKEN__", {"mode": "token", "reason": DATA["token"], "deadline": None})
@@ -108,12 +110,12 @@ for place_id in MAPS.values():
             "mode": "open",
             "reason": "เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง",
             "deadline": None,
+            "seconds": 60,
         },
     )
 
 def reconcile_locked():
     now = time.time()
-    changed = False
     for place_id, state in DATA["places"].items():
         if (
             state["mode"] == "scheduled"
@@ -123,7 +125,6 @@ def reconcile_locked():
             state["mode"] = "closed"
             state["deadline"] = None
             save_to_supabase(place_id, state)
-            changed = True
 
 def snapshot(place_id):
     with LOCK:
@@ -139,11 +140,14 @@ def update_state(place_id, mode=None, reason=None, seconds=None):
         if mode is not None:
             state["mode"] = mode
             if mode == "scheduled" and seconds is not None:
+                state["seconds"] = seconds
                 state["deadline"] = time.time() + seconds
             elif mode != "scheduled":
                 state["deadline"] = None
         if reason is not None:
             state["reason"] = reason
+        if seconds is not None:
+            state["seconds"] = seconds
         save_to_supabase(place_id, state)
 
 
@@ -229,7 +233,7 @@ HTML_TEMPLATE = """
             <label>เหตุผล / ข้อความเตะ:</label>
             <div class="reason-box">
                 <input type="text" id="reasonInput" value="เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง">
-                <button type="button" class="btn-save-reason" onclick="saveReasonOnly()">💾 บันทึกข้อความ</button>
+                <button type="button" class="btn-save-reason" onclick="saveConfigOnly()">💾 บันทึกค่า</button>
             </div>
         </div>
         <div class="checkbox-group">
@@ -242,7 +246,7 @@ HTML_TEMPLATE = """
         </div>
         <div class="btn-container">
             <button class="btn-close" onclick="sendAction('scheduled')">🛑 เริ่มปิด (แมพที่เลือก)</button>
-            <button class="btn-cancel" onclick="sendAction('open-cancel')">↩️ ยกเลิก (แมพที่เลือก)</button>
+            <button class="btn-cancel" onclick="sendAction('open-cancel')">↩️️ ยกเลิก (แมพที่เลือก)</button>
             <button class="btn-open" onclick="sendAction('open')">✅ เปิดแมพ (แมพที่เลือก)</button>
         </div>
         <div class="btn-container" style="flex-direction: column; gap: 5px;">
@@ -265,6 +269,9 @@ HTML_TEMPLATE = """
             if(res.ok) {
                 const data = await res.json();
                 document.getElementById('reasonInput').value = data.reason;
+                if(data.seconds) {
+                    document.getElementById('secondsInput').value = data.seconds;
+                }
                 let modeText = data.mode === 'open' ? '🟢 เปิดให้บริการ' : (data.mode === 'scheduled' ? '⏳ กำลังนับถอยหลัง' : '🔴 ปิดปรับปรุง');
                 document.getElementById('statusView').innerText = "สถานะ: " + modeText;
             }
@@ -274,19 +281,20 @@ HTML_TEMPLATE = """
             document.getElementById('secondsGroup').style.display = enabled ? 'block' : 'none';
         }
 
-        async function saveReasonOnly() {
+        async function saveConfigOnly() {
             const pid = document.getElementById('mapSelect').value;
             const reason = document.getElementById('reasonInput').value;
+            const seconds = document.getElementById('secondsInput').value;
 
-            const res = await fetch('/api/save-reason', {
+            const res = await fetch('/api/save-config', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({place_id: pid, reason: reason})
+                body: JSON.stringify({place_id: pid, reason: reason, seconds: parseInt(seconds) || 60})
             });
             if(res.ok) {
-                alert('บันทึกข้อความ/เหตุผลสำเร็จ!');
+                alert('บันทึกข้อความและวินาทีสำเร็จ!');
             } else {
-                alert('เกิดข้อผิดพลาดในการบันทึกข้อความ');
+                alert('เกิดข้อผิดพลาดในการบันทึก');
             }
         }
 
@@ -318,10 +326,6 @@ HTML_TEMPLATE = """
 
         async function sendActionAll(actionType) {
             let confirmMsg = 'คุณแน่ใจหรือไม่ที่จะดำเนินการกับ "ทุกแมพ" พร้อมกัน?';
-            if(actionType === 'scheduled') confirmMsg = 'คุณแน่ใจหรือไม่ที่จะปิดเซิร์ฟเวอร์ "ทุกแมพ" พร้อมกัน?';
-            if(actionType === 'open') confirmMsg = 'คุณแน่ใจหรือไม่ที่จะเปิดให้บริการ "ทุกแมพ" พร้อมกัน?';
-            if(actionType === 'open-cancel') confirmMsg = 'คุณแน่ใจหรือไม่ที่จะยกเลิกการปิดของ "ทุกแมพ" พร้อมกัน?';
-
             if(!confirm(confirmMsg)) return;
 
             const reason = document.getElementById('reasonInput').value;
@@ -382,21 +386,22 @@ def api_get_state(place_id):
         return jsonify({"error": "unknown place"}), 404
     return jsonify(snapshot(place_id))
 
-@app.post("/api/save-reason")
-def api_save_reason():
+@app.post("/api/save-config")
+def api_save_config():
     req = request.json
     pid = req.get("place_id")
     reason = req.get("reason")
+    seconds = req.get("seconds")
     
     if pid == "ALL":
         for place_id in MAPS.values():
-            update_state(place_id, reason=reason)
+            update_state(place_id, reason=reason, seconds=seconds)
         return jsonify({"success": True})
         
     if pid not in MAPS.values():
         return jsonify({"error": "unknown place"}), 404
         
-    update_state(pid, reason=reason)
+    update_state(pid, reason=reason, seconds=seconds)
     return jsonify({"success": True})
 
 @app.post("/api/update")
