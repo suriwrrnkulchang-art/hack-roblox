@@ -6,14 +6,24 @@ import threading
 import time
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string, request
+from flask import (
+    Flask,
+    jsonify,
+    redirect,
+    render_template_string,
+    request,
+    session,
+)
 from waitress import serve
 
 
+# ---------- ตั้งค่าระบบและความปลอดภัย ----------
+ADMIN_PASSWORD = "6155045"  # <-- เปลี่ยนรหัสผ่านตรงนี้ตามต้องการ (ใช้สำหรับเข้าหน้าเว็บ)
+
 # ---------- ตั้งค่าแมพ (ใช้ Place ID ทั้ง 2 แมพตามเดิม) ----------
 MAPS = {
-    "แมพแถวแรก (Place 1)": "120651982896178",
-    "Sky Film (Place 2)": "120651982896178",
+    "(Place 1)": "120651982896178",
+    "(Place 2)": "77210125175879",
 }
 
 HOST = "0.0.0.0"
@@ -94,8 +104,39 @@ def update_state(place_id, mode, reason=None, seconds=None):
 
 # ---------- Flask Web & API Server ----------
 app = Flask(__name__)
+app.secret_key = secrets.token_hex(16)
 
-# หน้าเว็บควบคุม (Web Dashboard)
+# หน้าเว็บสำหรับกรอกรหัสผ่าน
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <title>Login - Roblox Control Center</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #1e1e2f; color: #d1d1e0; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .login-box { background: #2a2a40; padding: 30px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); width: 100%; max-width: 350px; text-align: center; }
+        h2 { color: #fff; margin-bottom: 20px; }
+        input { width: 100%; padding: 10px; margin-bottom: 15px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
+        button { width: 100%; padding: 10px; background: #7692ff; border: none; border-radius: 6px; font-weight: bold; color: #fff; cursor: pointer; }
+        button:hover { opacity: 0.9; }
+        .error { color: #ff4d4d; font-size: 14px; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="login-box">
+        <h2>🔒 เข้าสู่ระบบ</h2>
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
+        <form method="POST">
+            <input type="password" name="password" placeholder="กรอกรหัสผ่านแอดมิน" required>
+            <button type="submit">เข้าสู่ระบบ</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+# หน้าเว็บควบคุมหลัก (Web Dashboard)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="th">
@@ -106,7 +147,8 @@ HTML_TEMPLATE = """
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e2f; color: #d1d1e0; margin: 0; padding: 20px; display: flex; justify-content: center; }
         .container { width: 100%; max-width: 600px; background: #2a2a40; padding: 25px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
-        h2 { color: #ffffff; margin-top: 0; border-bottom: 2px solid #3f3f5f; padding-bottom: 10px; }
+        h2 { color: #ffffff; margin-top: 0; border-bottom: 2px solid #3f3f5f; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
+        .logout-btn { font-size: 12px; background: #ff4d4d; padding: 5px 10px; border-radius: 4px; color: #fff; text-decoration: none; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; color: #7692ff; font-weight: bold; }
         select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
@@ -123,7 +165,7 @@ HTML_TEMPLATE = """
 </head>
 <body>
     <div class="container">
-        <h2>🛡️ Roblox Control Center</h2>
+        <h2>🛡️ Roblox Control Center <a href="/logout" class="logout-btn">ออกจากระบบ</a></h2>
         <div class="form-group">
             <label>เลือกแมพ:</label>
             <select id="mapSelect" onchange="loadMapState()">
@@ -161,7 +203,7 @@ HTML_TEMPLATE = """
                 const data = await res.json();
                 document.getElementById('reasonInput').value = data.reason;
                 let modeText = data.mode === 'open' ? '🟢 เปิดให้บริการ' : (data.mode === 'scheduled' ? '⏳ กำลังนับถอยหลัง' : '🔴 ปิดปรับปรุง');
-                document.getElementById('statusView.innerHTML').innerText = "สถานะ: " + modeText;
+                document.getElementById('statusView').innerText = "สถานะ: " + modeText;
             }
         }
         function toggleTimerInput() {
@@ -173,7 +215,7 @@ HTML_TEMPLATE = """
             const reason = document.getElementById('reasonInput').value;
             const seconds = document.getElementById('secondsInput').value;
             let mode = 'open';
-            if(actionType === 'scheduled') mode = document.getElementById('timerEnabled').checked ? 'scheduled' : 'closed';
+            if(actionType === 'scheduled') mode = document.getElementById('timerEnabled'].checked ? 'scheduled' : 'closed';
             if(actionType === 'open') mode = 'open';
             if(actionType === 'open-cancel') mode = 'open';
 
@@ -197,11 +239,29 @@ HTML_TEMPLATE = """
 """
 
 
-@app.get("/")
+@app.route("/", methods=["GET", "POST"])
 def dashboard():
+    if request.method == "POST":
+        if request.form.get("password") == ADMIN_PASSWORD:
+            response = redirect("/")
+            response.set_cookie("auth", ADMIN_PASSWORD)
+            return response
+        else:
+            return render_template_string(LOGIN_HTML, error="รหัสผ่านไม่ถูกต้อง!")
+
+    if request.cookies.get("auth") != ADMIN_PASSWORD:
+        return render_template_string(LOGIN_HTML, error=None)
+
     return render_template_string(
         HTML_TEMPLATE, maps=MAPS, token=DATA["token"]
     )
+
+
+@app.get("/logout")
+def logout():
+    response = redirect("/")
+    response.set_cookie("auth", "", expires=0)
+    return response
 
 
 @app.get("/api/state/<place_id>")
@@ -209,9 +269,6 @@ def api_get_state(place_id):
     if place_id not in MAPS.values():
         return jsonify({"error": "unknown place"}), 404
     return jsonify(snapshot(place_id))
-
-
-from flask import request
 
 
 @app.post("/api/update")
