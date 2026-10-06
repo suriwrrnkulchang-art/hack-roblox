@@ -89,18 +89,23 @@ def snapshot(place_id):
         return result
 
 
-def update_state(place_id, mode, reason=None, seconds=None):
+def update_state(place_id, mode=None, reason=None, seconds=None):
     with LOCK:
         reconcile_locked()
         state = DATA["places"][place_id]
+        
+        # อัปเดตโหมดเฉพาะเมื่อมีการส่งค่าโหมดมา
         if mode is not None:
             state["mode"] = mode
-        if seconds is not None:
-            state["deadline"] = (
-                time.time() + seconds if state["mode"] == "scheduled" else None
-            )
+            if mode == "scheduled" and seconds is not None:
+                state["deadline"] = time.time() + seconds
+            elif mode != "scheduled":
+                state["deadline"] = None
+                
+        # อัปเดตเหตุผลเมื่อมีการส่งค่ามา
         if reason is not None:
             state["reason"] = reason
+            
         save_locked()
 
 
@@ -347,18 +352,18 @@ def api_get_state(place_id):
 @app.post("/api/save-reason")
 def api_save_reason():
     req = request.json
-    pid = req.get("place_id")
+    pid = req.get("pid") or req.get("place_id")
     reason = req.get("reason")
     
     if pid == "ALL":
         for place_id in MAPS.values():
-            update_state(place_id, mode=None, reason=reason, seconds=None)
+            update_state(place_id, reason=reason)
         return jsonify({"success": True})
         
     if pid not in MAPS.values():
         return jsonify({"error": "unknown place"}), 404
         
-    update_state(pid, mode=None, reason=reason, seconds=None)
+    update_state(pid, reason=reason)
     return jsonify({"success": True})
 
 
