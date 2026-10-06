@@ -203,4 +203,255 @@ HTML_TEMPLATE = """
         .logout-btn { font-size: 12px; background: #ff4d4d; padding: 5px 10px; border-radius: 4px; color: #fff; text-decoration: none; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; color: #7692ff; font-weight: bold; }
-        select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius:
+        select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
+        .reason-box { display: flex; gap: 10px; }
+        .reason-box input { flex: 1; }
+        .btn-save-reason { background: #0984e3; white-space: nowrap; padding: 0 15px; cursor: pointer; border: none; border-radius: 6px; font-weight: bold; color: #fff; }
+        .btn-save-reason:hover { opacity: 0.9; }
+        .checkbox-group { display: flex; align-items: center; gap: 10px; margin: 15px 0; }
+        .btn-container { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+        button { padding: 10px 18px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; color: #fff; font-size: 14px; flex: 1; min-width: 120px; }
+        .btn-close { background: #ff4d4d; }
+        .btn-cancel { background: #ffa502; }
+        .btn-open { background: #00b894; }
+        .btn-close-all { background: #d63031; width: 100%; margin-top: 10px; }
+        .btn-open-all { background: #00cec9; width: 100%; margin-top: 10px; }
+        .btn-cancel-all { background: #e17055; width: 100%; margin-top: 10px; }
+        button:hover { opacity: 0.9; }
+        .status-box { background: #1e1e2f; padding: 15px; border-radius: 6px; margin-top: 20px; border-left: 5px solid #00ffcc; }
+        .token-box { margin-top: 20px; font-size: 12px; word-break: break-all; background: #15151f; padding: 10px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🛡️ Roblox Control Center <a href="/logout" class="logout-btn">ออกจากระบบ</a></h2>
+        <div class="form-group">
+            <label>เลือกแมพ:</label>
+            <select id="mapSelect" onchange="loadMapState()">
+                <option value="ALL">🌐 จัดการทั้งหมด (ทุกแมพ)</option>
+                {% for name, pid in maps.items() %}
+                <option value="{{ pid }}">{{ name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-group">
+            <label>เหตุผล / ข้อความเตะ:</label>
+            <div class="reason-box">
+                <input type="text" id="reasonInput" value="เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง">
+                <button type="button" class="btn-save-reason" onclick="saveReasonOnly()">💾 บันทึกข้อความ</button>
+            </div>
+        </div>
+        <div class="checkbox-group">
+            <input type="checkbox" id="timerEnabled" checked onchange="toggleTimerInput()">
+            <label for="timerEnabled" style="margin:0; color:#d1d1e0;">นับถอยหลังก่อนปิด</label>
+        </div>
+        <div class="form-group" id="secondsGroup">
+            <label>เวลา (วินาที):</label>
+            <input type="text" id="secondsInput" value="60">
+        </div>
+        <div class="btn-container">
+            <button class="btn-close" onclick="sendAction('scheduled')">🛑 เริ่มปิด (แมพที่เลือก)</button>
+            <button class="btn-cancel" onclick="sendAction('open-cancel')">↩️ ยกเลิก (แมพที่เลือก)</button>
+            <button class="btn-open" onclick="sendAction('open')">✅ เปิดแมพ (แมพที่เลือก)</button>
+        </div>
+        <div class="btn-container" style="flex-direction: column; gap: 5px;">
+            <button class="btn-close-all" onclick="sendActionAll('scheduled')">🚨 ปิดเซิร์ฟเวอร์ทั้งหมดทันที (ทุกแมพ)</button>
+            <button class="btn-cancel-all" onclick="sendActionAll('open-cancel')">↩️ ยกเลิกการปิดทั้งหมด (ทุกแมพ)</button>
+            <button class="btn-open-all" onclick="sendActionAll('open')">✅ เปิดให้บริการทั้งหมด (ทุกแมพ)</button>
+        </div>
+        <div class="status-box" id="statusView">กำลังโหลดสถานะ...</div>
+        <div class="token-box"><b>API Token (สำหรับใส่ในสคริปต์ Roblox):</b><br>{{ token }}</div>
+    </div>
+
+    <script>
+        async function loadMapState() {
+            const pid = document.getElementById('mapSelect').value;
+            if(pid === 'ALL') {
+                document.getElementById('statusView').innerText = "สถานะ: กำลังควบคุมทุกแมพพร้อมกัน";
+                return;
+            }
+            const res = await fetch('/api/state/' + pid);
+            if(res.ok) {
+                const data = await res.json();
+                document.getElementById('reasonInput').value = data.reason;
+                let modeText = data.mode === 'open' ? '🟢 เปิดให้บริการ' : (data.mode === 'scheduled' ? '⏳ กำลังนับถอยหลัง' : '🔴 ปิดปรับปรุง');
+                document.getElementById('statusView').innerText = "สถานะ: " + modeText;
+            }
+        }
+        function toggleTimerInput() {
+            const enabled = document.getElementById('timerEnabled').checked;
+            document.getElementById('secondsGroup').style.display = enabled ? 'block' : 'none';
+        }
+
+        async function saveReasonOnly() {
+            const pid = document.getElementById('mapSelect').value;
+            const reason = document.getElementById('reasonInput').value;
+
+            const res = await fetch('/api/save-reason', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({place_id: pid, reason: reason})
+            });
+            if(res.ok) {
+                alert('บันทึกข้อความ/เหตุผลสำเร็จ!');
+            } else {
+                alert('เกิดข้อผิดพลาดในการบันทึกข้อความ');
+            }
+        }
+
+        async function sendAction(actionType) {
+            const pid = document.getElementById('mapSelect').value;
+            if(pid === 'ALL') {
+                alert('กรุณาใช้ปุ่มควบคุมทั้งหมดด้านล่างสำหรับการสั่งการทุกแมพครับ');
+                return;
+            }
+            const reason = document.getElementById('reasonInput').value;
+            const seconds = document.getElementById('secondsInput').value;
+            let mode = 'open';
+            if(actionType === 'scheduled') mode = document.getElementById('timerEnabled').checked ? 'scheduled' : 'closed';
+            if(actionType === 'open') mode = 'open';
+            if(actionType === 'open-cancel') mode = 'open';
+
+            const res = await fetch('/api/update', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({place_id: pid, mode: mode, reason: reason, seconds: parseInt(seconds) || 60})
+            });
+            if(res.ok) {
+                alert('บันทึกคำสั่งสำเร็จ!');
+                loadMapState();
+            } else {
+                alert('เกิดข้อผิดพลาด');
+            }
+        }
+
+        async function sendActionAll(actionType) {
+            let confirmMsg = 'คุณแน่ใจหรือไม่ที่จะดำเนินการกับ "ทุกแมพ" พร้อมกัน?';
+            if(actionType === 'scheduled') confirmMsg = 'คุณแน่ใจหรือไม่ที่จะปิดเซิร์ฟเวอร์ "ทุกแมพ" พร้อมกัน?';
+            if(actionType === 'open') confirmMsg = 'คุณแน่ใจหรือไม่ที่จะเปิดให้บริการ "ทุกแมพ" พร้อมกัน?';
+            if(actionType === 'open-cancel') confirmMsg = 'คุณแน่ใจหรือไม่ที่จะยกเลิกการปิดของ "ทุกแมพ" พร้อมกัน?';
+
+            if(!confirm(confirmMsg)) return;
+
+            const reason = document.getElementById('reasonInput').value;
+            const seconds = document.getElementById('secondsInput').value;
+            let mode = 'open';
+            if(actionType === 'scheduled') {
+                mode = document.getElementById('timerEnabled').checked ? 'scheduled' : 'closed';
+            } else {
+                mode = 'open';
+            }
+
+            const res = await fetch('/api/update-all', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({mode: mode, reason: reason, seconds: parseInt(seconds) || 60})
+            });
+            if(res.ok) {
+                alert('ส่งคำสั่งจัดการทุกแมพสำเร็จ!');
+                loadMapState();
+            } else {
+                alert('เกิดข้อผิดพลาด');
+            }
+        }
+
+        setInterval(loadMapState, 3000);
+        loadMapState();
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route("/", methods=["GET", "POST"])
+def dashboard():
+    if request.method == "POST":
+        if request.form.get("password") == ADMIN_PASSWORD:
+            response = redirect("/")
+            response.set_cookie("auth", ADMIN_PASSWORD)
+            return response
+        else:
+            return render_template_string(LOGIN_HTML, error="รหัสผ่านไม่ถูกต้อง!")
+
+    if request.cookies.get("auth") != ADMIN_PASSWORD:
+        return render_template_string(LOGIN_HTML, error=None)
+
+    return render_template_string(
+        HTML_TEMPLATE, maps=MAPS, token=DATA["token"]
+    )
+
+
+@app.get("/logout")
+def logout():
+    response = redirect("/")
+    response.set_cookie("auth", "", expires=0)
+    return response
+
+
+@app.get("/api/state/<place_id>")
+def api_get_state(place_id):
+    if place_id not in MAPS.values():
+        return jsonify({"error": "unknown place"}), 404
+    return jsonify(snapshot(place_id))
+
+
+@app.post("/api/save-reason")
+def api_save_reason():
+    req = request.json
+    pid = req.get("place_id")
+    reason = req.get("reason")
+    
+    if pid == "ALL":
+        for place_id in MAPS.values():
+            update_state(place_id, reason=reason)
+        return jsonify({"success": True})
+        
+    if pid not in MAPS.values():
+        return jsonify({"error": "unknown place"}), 404
+        
+    update_state(pid, reason=reason)
+    return jsonify({"success": True})
+
+
+@app.post("/api/update")
+def api_update():
+    req = request.json
+    pid = req.get("place_id")
+    mode = req.get("mode")
+    reason = req.get("reason")
+    seconds = req.get("seconds")
+    if pid not in MAPS.values():
+        return jsonify({"error": "unknown place"}), 404
+    update_state(pid, mode, reason, seconds)
+    return jsonify({"success": True})
+
+
+@app.post("/api/update-all")
+def api_update_all():
+    req = request.json
+    mode = req.get("mode")
+    reason = req.get("reason")
+    seconds = req.get("seconds")
+    
+    for place_id in MAPS.values():
+        update_state(place_id, mode, reason, seconds)
+        
+    return jsonify({"success": True})
+
+
+# สำหรับให้เกม Roblox วิ่งมาเช็กสถานะ
+@app.get("/state/<place_id>")
+def get_state(place_id):
+    expected = "Bearer " + DATA["token"]
+    supplied = request.headers.get("Authorization", "")
+    if not secrets.compare_digest(supplied, expected):
+        return jsonify({"error": "unauthorized"}), 401
+    if place_id not in MAPS.values():
+        return jsonify({"error": "unknown place"}), 404
+    response = jsonify(snapshot(place_id))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+if __name__ == "__main__":
+    serve(app, host=HOST, port=PORT, threads=8)
