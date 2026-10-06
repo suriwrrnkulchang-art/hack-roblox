@@ -18,12 +18,12 @@ from waitress import serve
 
 
 # ---------- ตั้งค่าระบบและความปลอดภัย ----------
-ADMIN_PASSWORD = "6155045"  # <-- เปลี่ยนรหัสผ่านตรงนี้ตามต้องการ (ใช้สำหรับเข้าหน้าเว็บ)
+ADMIN_PASSWORD = "6155045"  # รหัสผ่านเข้าหน้าเว็บของคุณ
 
 # ---------- ตั้งค่าแมพ (ใช้ Place ID ทั้ง 2 แมพตามเดิม) ----------
 MAPS = {
-    "(Place 1)": "120651982896178",
-    "(Place 2)": "77210125175879",
+    "Place 1": "120651982896178",
+    "Place 2": "77210125175879",
 }
 
 HOST = "0.0.0.0"
@@ -215,7 +215,7 @@ HTML_TEMPLATE = """
             const reason = document.getElementById('reasonInput').value;
             const seconds = document.getElementById('secondsInput').value;
             let mode = 'open';
-            if(actionType === 'scheduled') mode = document.getElementById('timerEnabled'].checked ? 'scheduled' : 'closed';
+            if(actionType === 'scheduled') mode = document.getElementById('timerEnabled').checked ? 'scheduled' : 'closed';
             if(actionType === 'open') mode = 'open';
             if(actionType === 'open-cancel') mode = 'open';
 
