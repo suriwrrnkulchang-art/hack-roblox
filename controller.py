@@ -7,12 +7,13 @@ import time
 from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string, request
+from waitress import serve
 
 
 # ---------- ตั้งค่าแมพ (ใช้ Place ID ทั้ง 2 แมพตามเดิม) ----------
 MAPS = {
-    "แมพแถวแรก (Place 1)": "*************78",
-    "Sky Film (Place 2)": "*************9",
+    "แมพแถวแรก (Place 1)": "120651982896178",
+    "Sky Film (Place 2)": "120651982896178",
 }
 
 HOST = "0.0.0.0"
