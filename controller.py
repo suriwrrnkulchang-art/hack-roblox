@@ -158,6 +158,7 @@ HTML_TEMPLATE = """
         .btn-close { background: #ff4d4d; }
         .btn-cancel { background: #ffa502; }
         .btn-open { background: #00b894; }
+        .btn-close-all { background: #d63031; width: 100%; margin-top: 10px; }
         button:hover { opacity: 0.9; }
         .status-box { background: #1e1e2f; padding: 15px; border-radius: 6px; margin-top: 20px; border-left: 5px solid #00ffcc; }
         .token-box { margin-top: 20px; font-size: 12px; word-break: break-all; background: #15151f; padding: 10px; border-radius: 4px; }
@@ -169,6 +170,7 @@ HTML_TEMPLATE = """
         <div class="form-group">
             <label>เลือกแมพ:</label>
             <select id="mapSelect" onchange="loadMapState()">
+                <option value="ALL">🌐 ปิดทั้งหมด (ทุกแมพ)</option>
                 {% for name, pid in maps.items() %}
                 <option value="{{ pid }}">{{ name }}</option>
                 {% endfor %}
@@ -187,9 +189,12 @@ HTML_TEMPLATE = """
             <input type="text" id="secondsInput" value="60">
         </div>
         <div class="btn-container">
-            <button class="btn-close" onclick="sendAction('scheduled')">🛑 เริ่มปิด</button>
+            <button class="btn-close" onclick="sendAction('scheduled')">🛑 เริ่มปิด (แมพที่เลือก)</button>
             <button class="btn-cancel" onclick="sendAction('open-cancel')">↩️ ยกเลิก</button>
             <button class="btn-open" onclick="sendAction('open')">✅ เปิดแมพ</button>
+        </div>
+        <div class="btn-container">
+            <button class="btn-close-all" onclick="sendActionAll('scheduled')">🚨 ปิดเซิร์ฟเวอร์ทั้งหมดทันที (ทุกแมพ)</button>
         </div>
         <div class="status-box" id="statusView">กำลังโหลดสถานะ...</div>
         <div class="token-box"><b>API Token (สำหรับใส่ในสคริปต์ Roblox):</b><br>{{ token }}</div>
@@ -198,6 +203,10 @@ HTML_TEMPLATE = """
     <script>
         async function loadMapState() {
             const pid = document.getElementById('mapSelect').value;
+            if(pid === 'ALL') {
+                document.getElementById('statusView').innerText = "สถานะ: ควบคุมทุกแมพพร้อมกัน";
+                return;
+            }
             const res = await fetch('/api/state/' + pid);
             if(res.ok) {
                 const data = await res.json();
@@ -212,6 +221,10 @@ HTML_TEMPLATE = """
         }
         async function sendAction(actionType) {
             const pid = document.getElementById('mapSelect').value;
+            if(pid === 'ALL') {
+                alert('กรุณาใช้ปุ่ม "ปิดเซิร์ฟเวอร์ทั้งหมดทันที" ด้านล่าง หรือเลือกแมพเฉพาะเจาะจง');
+                return;
+            }
             const reason = document.getElementById('reasonInput').value;
             const seconds = document.getElementById('secondsInput').value;
             let mode = 'open';
@@ -231,6 +244,26 @@ HTML_TEMPLATE = """
                 alert('เกิดข้อผิดพลาด');
             }
         }
+
+        async function sendActionAll(actionType) {
+            if(!confirm('คุณแน่ใจหรือไม่ที่จะปิดเซิร์ฟเวอร์ "ทุกแมพ" พร้อมกัน?')) return;
+            const reason = document.getElementById('reasonInput').value;
+            const seconds = document.getElementById('secondsInput').value;
+            let mode = document.getElementById('timerEnabled').checked ? 'scheduled' : 'closed';
+
+            const res = await fetch('/api/update-all', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({mode: mode, reason: reason, seconds: parseInt(seconds) || 60})
+            });
+            if(res.ok) {
+                alert('ส่งคำสั่งปิดทุกแมพสำเร็จ!');
+                loadMapState();
+            } else {
+                alert('เกิดข้อผิดพลาด');
+            }
+        }
+
         setInterval(loadMapState, 3000);
         loadMapState();
     </script>
@@ -284,13 +317,27 @@ def api_update():
     return jsonify({"success": True})
 
 
+# เพิ่ม API สำหรับอัปเดตทุกแมพพร้อมกัน
+@app.post("/api/update-all")
+def api_update_all():
+    req = request.json
+    mode = req.get("mode")
+    reason = req.get("reason")
+    seconds = req.get("seconds")
+    
+    for place_id in MAPS.values():
+        update_state(place_id, mode, reason, seconds)
+        
+    return jsonify({"success": True})
+
+
 # สำหรับให้เกม Roblox วิ่งมาเช็กสถานะ
 @app.get("/state/<place_id>")
 def get_state(place_id):
     expected = "Bearer " + DATA["token"]
     supplied = request.headers.get("Authorization", "")
     if not secrets.compare_digest(supplied, expected):
-        return jsonify({"error": "unauthorized"}), 401
+        return jsonify({"error": "unauthorized"}}, 401
     if place_id not in MAPS.values():
         return jsonify({"error": "unknown place"}), 404
     response = jsonify(snapshot(place_id))
