@@ -94,7 +94,7 @@ def update_state(place_id, mode=None, reason=None, seconds=None):
         reconcile_locked()
         state = DATA["places"][place_id]
         
-        # อัปเดตโหมดเฉพาะเมื่อมีการส่งค่าโหมดมา
+        # อัปเดตโหมดเฉพาะเมื่อมีการส่งค่ามา
         if mode is not None:
             state["mode"] = mode
             if mode == "scheduled" and seconds is not None:
@@ -161,7 +161,8 @@ HTML_TEMPLATE = """
         select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
         .reason-box { display: flex; gap: 10px; }
         .reason-box input { flex: 1; }
-        .btn-save-reason { background: #0984e3; white-space: nowrap; padding: 0 15px; }
+        .btn-save-reason { background: #0984e3; white-space: nowrap; padding: 0 15px; cursor: pointer; border: none; border-radius: 6px; font-weight: bold; color: #fff; }
+        .btn-save-reason:hover { opacity: 0.9; }
         .checkbox-group { display: flex; align-items: center; gap: 10px; margin: 15px 0; }
         .btn-container { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
         button { padding: 10px 18px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; color: #fff; font-size: 14px; flex: 1; min-width: 120px; }
@@ -352,7 +353,7 @@ def api_get_state(place_id):
 @app.post("/api/save-reason")
 def api_save_reason():
     req = request.json
-    pid = req.get("pid") or req.get("place_id")
+    pid = req.get("place_id")
     reason = req.get("reason")
     
     if pid == "ALL":
