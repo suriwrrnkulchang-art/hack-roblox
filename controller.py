@@ -13,7 +13,6 @@ from flask import (
     redirect,
     render_template_string,
     request,
-    session,
 )
 from waitress import serve
 
@@ -86,7 +85,7 @@ def save_to_supabase(place_id, state_data):
     except Exception as e:
         print("Save error:", e)
 
-# โหลดข้อมูลจาก Supabase
+# โหลดข้อมูลเริ่มต้นจาก Supabase
 DATA = load_from_supabase()
 if not DATA or not DATA.get("places"):
     DATA = {
@@ -112,7 +111,6 @@ for place_id in MAPS.values():
         },
     )
 
-
 def reconcile_locked():
     now = time.time()
     changed = False
@@ -127,7 +125,6 @@ def reconcile_locked():
             save_to_supabase(place_id, state)
             changed = True
 
-
 def snapshot(place_id):
     with LOCK:
         reconcile_locked()
@@ -135,22 +132,18 @@ def snapshot(place_id):
         result["serverNow"] = time.time()
         return result
 
-
 def update_state(place_id, mode=None, reason=None, seconds=None):
     with LOCK:
         reconcile_locked()
         state = DATA["places"][place_id]
-        
         if mode is not None:
             state["mode"] = mode
             if mode == "scheduled" and seconds is not None:
                 state["deadline"] = time.time() + seconds
             elif mode != "scheduled":
                 state["deadline"] = None
-                
         if reason is not None:
             state["reason"] = reason
-            
         save_to_supabase(place_id, state)
 
 
@@ -158,7 +151,6 @@ def update_state(place_id, mode=None, reason=None, seconds=None):
 app = Flask(__name__)
 app.secret_key = secrets.token_hex(16)
 
-# หน้าเว็บสำหรับกรอกรหัสผ่าน
 LOGIN_HTML = """
 <!DOCTYPE html>
 <html lang="th">
@@ -188,7 +180,6 @@ LOGIN_HTML = """
 </html>
 """
 
-# หน้าเว็บควบคุมหลัก (Web Dashboard)
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="th">
@@ -362,7 +353,6 @@ HTML_TEMPLATE = """
 </html>
 """
 
-
 @app.route("/", methods=["GET", "POST"])
 def dashboard():
     if request.method == "POST":
@@ -380,20 +370,17 @@ def dashboard():
         HTML_TEMPLATE, maps=MAPS, token=DATA["token"]
     )
 
-
 @app.get("/logout")
 def logout():
     response = redirect("/")
     response.set_cookie("auth", "", expires=0)
     return response
 
-
 @app.get("/api/state/<place_id>")
 def api_get_state(place_id):
     if place_id not in MAPS.values():
         return jsonify({"error": "unknown place"}), 404
     return jsonify(snapshot(place_id))
-
 
 @app.post("/api/save-reason")
 def api_save_reason():
@@ -412,7 +399,6 @@ def api_save_reason():
     update_state(pid, reason=reason)
     return jsonify({"success": True})
 
-
 @app.post("/api/update")
 def api_update():
     req = request.json
@@ -424,7 +410,6 @@ def api_update():
         return jsonify({"error": "unknown place"}), 404
     update_state(pid, mode, reason, seconds)
     return jsonify({"success": True})
-
 
 @app.post("/api/update-all")
 def api_update_all():
@@ -438,8 +423,6 @@ def api_update_all():
         
     return jsonify({"success": True})
 
-
-# สำหรับให้เกม Roblox วิ่งมาเช็กสถานะ
 @app.get("/state/<place_id>")
 def get_state(place_id):
     expected = "Bearer " + DATA["token"]
@@ -451,7 +434,6 @@ def get_state(place_id):
     response = jsonify(snapshot(place_id))
     response.headers["Cache-Control"] = "no-store"
     return response
-
 
 if __name__ == "__main__":
     serve(app, host=HOST, port=PORT, threads=8)
