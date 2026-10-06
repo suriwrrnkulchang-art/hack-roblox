@@ -6,18 +6,17 @@ import threading
 import time
 from pathlib import Path
 
-from flask import Flask, jsonify, request
-from waitress import serve
+from flask import Flask, jsonify, render_template_string, request
 
 
 # ---------- ตั้งค่าแมพ (ใช้ Place ID ทั้ง 2 แมพตามเดิม) ----------
 MAPS = {
-    "(Place 1)": "120651982896178",
-    "(Place 2)": "77210125175879",
+    "แมพแถวแรก (Place 1)": "*************78",
+    "Sky Film (Place 2)": "*************9",
 }
 
-HOST = "0.0.0.0"  # ต้องตั้งเป็น 0.0.0.0 สำหรับบน Cloud
-PORT = int(os.environ.get("PORT", 8888))  # ดึง Port ตามที่ Render กำหนดให้อัตโนมัติ
+HOST = "0.0.0.0"
+PORT = int(os.environ.get("PORT", 8888))
 
 DATA_FILE = Path(__file__).resolve().with_name("controller_state.json")
 LOCK = threading.RLock()
@@ -79,31 +78,167 @@ def snapshot(place_id):
         return result
 
 
-# ---------- Flask API Server ----------
+def update_state(place_id, mode, reason=None, seconds=None):
+    with LOCK:
+        reconcile_locked()
+        state = DATA["places"][place_id]
+        state["mode"] = mode
+        state["deadline"] = (
+            time.time() + seconds if mode == "scheduled" else None
+        )
+        if reason is not None:
+            state["reason"] = reason
+        save_locked()
+
+
+# ---------- Flask Web & API Server ----------
 app = Flask(__name__)
+
+# หน้าเว็บควบคุม (Web Dashboard)
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Roblox Control Center</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #1e1e2f; color: #d1d1e0; margin: 0; padding: 20px; display: flex; justify-content: center; }
+        .container { width: 100%; max-width: 600px; background: #2a2a40; padding: 25px; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.3); }
+        h2 { color: #ffffff; margin-top: 0; border-bottom: 2px solid #3f3f5f; padding-bottom: 10px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; color: #7692ff; font-weight: bold; }
+        select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
+        .checkbox-group { display: flex; align-items: center; gap: 10px; margin: 15px 0; }
+        .btn-container { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 20px; }
+        button { padding: 10px 18px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; color: #fff; font-size: 14px; flex: 1; min-width: 120px; }
+        .btn-close { background: #ff4d4d; }
+        .btn-cancel { background: #ffa502; }
+        .btn-open { background: #00b894; }
+        button:hover { opacity: 0.9; }
+        .status-box { background: #1e1e2f; padding: 15px; border-radius: 6px; margin-top: 20px; border-left: 5px solid #00ffcc; }
+        .token-box { margin-top: 20px; font-size: 12px; word-break: break-all; background: #15151f; padding: 10px; border-radius: 4px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>🛡️ Roblox Control Center</h2>
+        <div class="form-group">
+            <label>เลือกแมพ:</label>
+            <select id="mapSelect" onchange="loadMapState()">
+                {% for name, pid in maps.items() %}
+                <option value="{{ pid }}">{{ name }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="form-group">
+            <label>เหตุผล / ข้อความเตะ:</label>
+            <input type="text" id="reasonInput" value="เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง">
+        </div>
+        <div class="checkbox-group">
+            <input type="checkbox" id="timerEnabled" checked onchange="toggleTimerInput()">
+            <label for="timerEnabled" style="margin:0; color:#d1d1e0;">นับถอยหลังก่อนปิด</label>
+        </div>
+        <div class="form-group" id="secondsGroup">
+            <label>เวลา (วินาที):</label>
+            <input type="text" id="secondsInput" value="60">
+        </div>
+        <div class="btn-container">
+            <button class="btn-close" onclick="sendAction('scheduled')">🛑 เริ่มปิด</button>
+            <button class="btn-cancel" onclick="sendAction('open-cancel')">↩️ ยกเลิก</button>
+            <button class="btn-open" onclick="sendAction('open')">✅ เปิดแมพ</button>
+        </div>
+        <div class="status-box" id="statusView">กำลังโหลดสถานะ...</div>
+        <div class="token-box"><b>API Token (สำหรับใส่ในสคริปต์ Roblox):</b><br>{{ token }}</div>
+    </div>
+
+    <script>
+        async function loadMapState() {
+            const pid = document.getElementById('mapSelect').value;
+            const res = await fetch('/api/state/' + pid);
+            if(res.ok) {
+                const data = await res.json();
+                document.getElementById('reasonInput').value = data.reason;
+                let modeText = data.mode === 'open' ? '🟢 เปิดให้บริการ' : (data.mode === 'scheduled' ? '⏳ กำลังนับถอยหลัง' : '🔴 ปิดปรับปรุง');
+                document.getElementById('statusView.innerHTML').innerText = "สถานะ: " + modeText;
+            }
+        }
+        function toggleTimerInput() {
+            const enabled = document.getElementById('timerEnabled').checked;
+            document.getElementById('secondsGroup').style.display = enabled ? 'block' : 'none';
+        }
+        async function sendAction(actionType) {
+            const pid = document.getElementById('mapSelect').value;
+            const reason = document.getElementById('reasonInput').value;
+            const seconds = document.getElementById('secondsInput').value;
+            let mode = 'open';
+            if(actionType === 'scheduled') mode = document.getElementById('timerEnabled').checked ? 'scheduled' : 'closed';
+            if(actionType === 'open') mode = 'open';
+            if(actionType === 'open-cancel') mode = 'open';
+
+            const res = await fetch('/api/update', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({place_id: pid, mode: mode, reason: reason, seconds: parseInt(seconds) || 60})
+            });
+            if(res.ok) {
+                alert('บันทึกคำสั่งสำเร็จ!');
+                loadMapState();
+            } else {
+                alert('เกิดข้อผิดพลาด');
+            }
+        }
+        setInterval(loadMapState, 3000);
+        loadMapState();
+    </script>
+</body>
+</html>
+"""
 
 
 @app.get("/")
-def home():
-    return "Roblox Controller Backend is running!", 200
+def dashboard():
+    return render_template_string(
+        HTML_TEMPLATE, maps=MAPS, token=DATA["token"]
+    )
 
 
+@app.get("/api/state/<place_id>")
+def api_get_state(place_id):
+    if place_id not in MAPS.values():
+        return jsonify({"error": "unknown place"}), 404
+    return jsonify(snapshot(place_id))
+
+
+from flask import request
+
+
+@app.post("/api/update")
+def api_update():
+    req = request.json
+    pid = req.get("place_id")
+    mode = req.get("mode")
+    reason = req.get("reason")
+    seconds = req.get("seconds")
+    if pid not in MAPS.values():
+        return jsonify({"error": "unknown place"}), 404
+    update_state(pid, mode, reason, seconds)
+    return jsonify({"success": True})
+
+
+# สำหรับให้เกม Roblox วิ่งมาเช็กสถานะ
 @app.get("/state/<place_id>")
 def get_state(place_id):
     expected = "Bearer " + DATA["token"]
     supplied = request.headers.get("Authorization", "")
-
     if not secrets.compare_digest(supplied, expected):
         return jsonify({"error": "unauthorized"}), 401
-
     if place_id not in MAPS.values():
         return jsonify({"error": "unknown place"}), 404
-
     response = jsonify(snapshot(place_id))
     response.headers["Cache-Control"] = "no-store"
     return response
 
 
 if __name__ == "__main__":
-    print(f"API Token ของคุณคือ: {DATA['token']}")
     serve(app, host=HOST, port=PORT, threads=8)
