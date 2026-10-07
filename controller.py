@@ -19,6 +19,7 @@ from waitress import serve
 
 # ---------- ตั้งค่าระบบและความปลอดภัย ----------
 ADMIN_PASSWORD = "6155045"
+TOKEN_PIN = "991675788" # รหัสสำหรับดูและเปลี่ยน Token
 
 # ---------- ตั้งค่าแมพ ----------
 MAPS = {
@@ -198,7 +199,7 @@ HTML_TEMPLATE = """
         .logout-btn { font-size: 12px; background: #ff4d4d; padding: 5px 10px; border-radius: 4px; color: #fff; text-decoration: none; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; color: #7692ff; font-weight: bold; }
-        select, input[type="text"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
+        select, input[type="text"], input[type="password"] { width: 100%; padding: 10px; background: #1e1e2f; border: 1px solid #3f3f5f; color: #fff; border-radius: 6px; box-sizing: border-box; }
         .reason-box { display: flex; gap: 10px; }
         .reason-box input { flex: 1; }
         .btn-save-reason { background: #0984e3; white-space: nowrap; padding: 0 15px; cursor: pointer; border: none; border-radius: 6px; font-weight: bold; color: #fff; }
@@ -214,7 +215,12 @@ HTML_TEMPLATE = """
         .btn-cancel-all { background: #e17055; width: 100%; margin-top: 10px; }
         button:hover { opacity: 0.9; }
         .status-box { background: #1e1e2f; padding: 15px; border-radius: 6px; margin-top: 20px; border-left: 5px solid #00ffcc; }
-        .token-box { margin-top: 20px; font-size: 12px; word-break: break-all; background: #15151f; padding: 10px; border-radius: 4px; }
+        
+        .token-box { margin-top: 20px; font-size: 13px; background: #15151f; padding: 15px; border-radius: 6px; border: 1px solid #3f3f5f;}
+        .token-controls { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap;}
+        .token-controls input { flex: 2; min-width: 150px; margin-bottom: 0; }
+        .btn-toggle { background: #9b59b6; flex: 1; min-width: 100px; }
+        .btn-new-token { background: #e67e22; flex: 1; min-width: 100px; }
     </style>
 </head>
 <body>
@@ -246,7 +252,7 @@ HTML_TEMPLATE = """
         </div>
         <div class="btn-container">
             <button class="btn-close" onclick="sendAction('scheduled')">🛑 เริ่มปิด (แมพที่เลือก)</button>
-            <button class="btn-cancel" onclick="sendAction('open-cancel')">↩️️ ยกเลิก (แมพที่เลือก)</button>
+            <button class="btn-cancel" onclick="sendAction('open-cancel')">↩ ยกเลิก (แมพที่เลือก)</button>
             <button class="btn-open" onclick="sendAction('open')">✅ เปิดแมพ (แมพที่เลือก)</button>
         </div>
         <div class="btn-container" style="flex-direction: column; gap: 5px;">
@@ -255,10 +261,56 @@ HTML_TEMPLATE = """
             <button class="btn-open-all" onclick="sendActionAll('open')">✅ เปิดให้บริการทั้งหมด (ทุกแมพ)</button>
         </div>
         <div class="status-box" id="statusView">กำลังโหลดสถานะ...</div>
-        <div class="token-box"><b>API Token (สำหรับใส่ในสคริปต์ Roblox):</b><br>{{ token }}</div>
+        
+        <div class="token-box">
+            <b style="color:#7692ff;">🔑 API Token (สำหรับใส่ในสคริปต์ Roblox):</b><br>
+            <div id="tokenDisplay" style="margin-top:8px; font-family:monospace; color:#00ffcc; word-break: break-all;">****************************************</div>
+            
+            <div class="token-controls">
+                <input type="password" id="pinInput" placeholder="ใส่รหัสเพื่อจัดการ Token">
+                <button class="btn-toggle" onclick="toggleToken()">👁️ เปิด/ปิดตา</button>
+                <button class="btn-new-token" onclick="generateNewToken()">🔄 สร้างใหม่</button>
+            </div>
+        </div>
     </div>
 
     <script>
+        // ระบบจัดการ Token
+        let actualToken = "{{ token }}";
+        let isTokenVisible = false;
+        const SECRET_PIN = "991675788";
+
+        function toggleToken() {
+            const pin = document.getElementById('pinInput').value;
+            if(pin !== SECRET_PIN) {
+                alert("รหัสผ่านไม่ถูกต้อง ไม่สามารถดู Token ได้!");
+                return;
+            }
+            isTokenVisible = !isTokenVisible;
+            document.getElementById('tokenDisplay').innerText = isTokenVisible ? actualToken : "****************************************";
+        }
+
+        async function generateNewToken() {
+            const pin = document.getElementById('pinInput').value;
+            if(pin !== SECRET_PIN) {
+                alert("รหัสผ่านไม่ถูกต้อง ไม่สามารถสร้าง Token ใหม่ได้!");
+                return;
+            }
+            if(!confirm("⚠️ คุณแน่ใจหรือไม่ที่จะสร้าง Token ใหม่?\\nสคริปต์เก่าใน Roblox จะใช้งานไม่ได้ทันที จนกว่าคุณจะเอา Token ใหม่ไปใส่!")) return;
+
+            const res = await fetch('/api/new-token', { method: 'POST' });
+            if(res.ok) {
+                const data = await res.json();
+                actualToken = data.token;
+                if(isTokenVisible) {
+                    document.getElementById('tokenDisplay').innerText = actualToken;
+                }
+                alert("✅ สร้างและบันทึก Token ใหม่สำเร็จ! อย่าลืมคัดลอกไปใส่ใน Roblox");
+            } else {
+                alert("❌ เกิดข้อผิดพลาดในการสร้าง Token");
+            }
+        }
+
         async function loadMapState() {
             const pid = document.getElementById('mapSelect').value;
             if(pid === 'ALL') {
@@ -379,6 +431,19 @@ def logout():
     response = redirect("/")
     response.set_cookie("auth", "", expires=0)
     return response
+
+# ----------- เพิ่ม API สำหรับเปลี่ยน Token -----------
+@app.post("/api/new-token")
+def api_new_token():
+    if request.cookies.get("auth") != ADMIN_PASSWORD:
+        return jsonify({"error": "unauthorized"}), 401
+        
+    with LOCK:
+        new_token = secrets.token_urlsafe(32)
+        DATA["token"] = new_token
+        # บันทึก Token ใหม่ทับของเดิมใน Supabase
+        save_to_supabase("__SYS_TOKEN__", {"mode": "token", "reason": new_token, "deadline": None})
+        return jsonify({"success": True, "token": new_token})
 
 @app.get("/api/state/<place_id>")
 def api_get_state(place_id):
