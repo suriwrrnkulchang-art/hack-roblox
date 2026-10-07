@@ -673,6 +673,17 @@ def save_to_supabase(
     place_id,
     state_data,
 ):
+    """
+    บันทึกข้อมูลลง Supabase และตรวจสอบว่า
+    Supabase รับค่าที่เราส่งจริง
+
+    IMPORTANT:
+    - ไม่เปลี่ยน DATA โดยตรง
+    - ไม่เปลี่ยนโครงสร้าง state
+    - ใช้ return=representation
+      เพื่อยืนยันข้อมูลที่ถูกบันทึก
+    """
+
     if place_id == SYSTEM_TOKEN_ID:
 
         payload = {
@@ -705,7 +716,16 @@ def save_to_supabase(
             ),
         }
 
-    return supabase_request(
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # เดิมใช้ return=minimal
+    #
+    # ตอนนี้ใช้ return=representation
+    # เพื่อให้ Supabase ส่ง row ที่บันทึกกลับมา
+    # --------------------------------------------------------
+
+    result = supabase_request(
         "POST",
         "control_state",
         payload=payload,
@@ -714,9 +734,145 @@ def save_to_supabase(
         },
         prefer=(
             "resolution=merge-duplicates,"
-            "return=minimal"
+            "return=representation"
         ),
     )
+
+    # --------------------------------------------------------
+    # Verify Token
+    # --------------------------------------------------------
+
+    if place_id == SYSTEM_TOKEN_ID:
+
+        if not isinstance(
+            result,
+            list,
+        ) or not result:
+
+            raise RuntimeError(
+                "Supabase ไม่ยืนยันการบันทึก Token"
+            )
+
+        saved_row = result[0]
+
+        saved_token = str(
+            saved_row.get(
+                "reason",
+                "",
+            )
+        )
+
+        expected_token = str(
+            payload["reason"]
+        )
+
+        if not safe_equal(
+            saved_token,
+            expected_token,
+        ):
+
+            raise RuntimeError(
+                "Supabase บันทึก Token "
+                "แต่ค่าที่อ่านกลับมาไม่ตรงกับค่าที่ส่ง"
+            )
+
+        return result
+
+    # --------------------------------------------------------
+    # Verify Normal Place
+    # --------------------------------------------------------
+
+    if not isinstance(
+        result,
+        list,
+    ) or not result:
+
+        raise RuntimeError(
+            f"Supabase ไม่ยืนยันการบันทึก Place {place_id}"
+        )
+
+    saved_row = result[0]
+
+    saved_place_id = str(
+        saved_row.get(
+            "place_id",
+            "",
+        )
+    )
+
+    if saved_place_id != place_id:
+
+        raise RuntimeError(
+            f"Supabase บันทึกผิด Place ID: "
+            f"{saved_place_id}"
+        )
+
+    # --------------------------------------------------------
+    # Verify Reason
+    # --------------------------------------------------------
+
+    saved_reason = normalize_reason(
+        saved_row.get(
+            "reason"
+        )
+    )
+
+    expected_reason = normalize_reason(
+        payload["reason"]
+    )
+
+    if saved_reason != expected_reason:
+
+        raise RuntimeError(
+            "Supabase บันทึกเหตุผล "
+            "แต่ค่าที่อ่านกลับมาไม่ตรงกับค่าที่ส่ง"
+        )
+
+    # --------------------------------------------------------
+    # Verify Seconds
+    # --------------------------------------------------------
+
+    try:
+
+        saved_seconds = normalize_seconds(
+            saved_row.get(
+                "seconds"
+            )
+        )
+
+    except ValueError:
+
+        raise RuntimeError(
+            "Supabase บันทึกเวลา "
+            "แต่ค่าที่อ่านกลับมาไม่ถูกต้อง"
+        )
+
+    if saved_seconds != int(
+        payload["seconds"]
+    ):
+
+        raise RuntimeError(
+            "Supabase บันทึกเวลา "
+            "แต่ค่าที่อ่านกลับมาไม่ตรงกับค่าที่ส่ง"
+        )
+
+    # --------------------------------------------------------
+    # Verify Mode
+    # --------------------------------------------------------
+
+    saved_mode = saved_row.get(
+        "mode",
+        "open",
+    )
+
+    if saved_mode != payload["mode"]:
+
+        raise RuntimeError(
+            "Supabase บันทึกสถานะ "
+            "แต่ค่าที่อ่านกลับมาไม่ตรงกับค่าที่ส่ง"
+        )
+
+    return result
 
 
 # ============================================================
@@ -4720,9 +4876,9 @@ def api_save_config():
 
             results = []
 
-            for pid in PLACE_IDS:
+            with WRITE_LOCK:
 
-                with WRITE_LOCK:
+                for pid in PLACE_IDS:
 
                     with LOCK:
 
@@ -4730,11 +4886,42 @@ def api_save_config():
                             DATA["places"][pid]
                         )
 
-                    new_state = clean_state({
-                        **current,
-                        "reason": reason,
-                        "seconds": seconds,
-                    })
+                    # ----------------------------------------
+                    # IMPORTANT:
+                    #
+                    # เปลี่ยนเฉพาะ:
+                    #   reason
+                    #   seconds
+                    #
+                    # ไม่เปลี่ยน:
+                    #   mode
+                    #   deadline
+                    #   commandStartedAt
+                    # ----------------------------------------
+
+                    new_state = copy.deepcopy(
+                        current
+                    )
+
+                    new_state["reason"] = (
+                        normalize_reason(
+                            reason
+                        )
+                    )
+
+                    new_state["seconds"] = (
+                        normalize_seconds(
+                            seconds
+                        )
+                    )
+
+                    new_state = clean_state(
+                        new_state
+                    )
+
+                    # ----------------------------------------
+                    # DB FIRST
+                    # ----------------------------------------
 
                     ok, error = save_with_retry(
                         pid,
@@ -4748,6 +4935,11 @@ def api_save_config():
                             f"{error}"
                         )
 
+                    # ----------------------------------------
+                    # DB confirmed.
+                    # Only now update RAM.
+                    # ----------------------------------------
+
                     with LOCK:
 
                         DATA["places"][pid] = (
@@ -4756,11 +4948,24 @@ def api_save_config():
                             )
                         )
 
-                results.append(
-                    snapshot(pid)
-                )
+                    results.append(
+                        snapshot(pid)
+                    )
 
-            save_local_backup()
+            # ----------------------------------------------
+            # Backup AFTER all DB writes succeeded
+            # ----------------------------------------------
+
+            backup_ok, backup_error = (
+                save_local_backup()
+            )
+
+            if not backup_ok:
+
+                LOG.warning(
+                    "Config DB saved but backup failed: %s",
+                    backup_error,
+                )
 
             return jsonify({
                 "ok": True,
@@ -4795,11 +5000,36 @@ def api_save_config():
                     DATA["places"][place_id]
                 )
 
-            new_state = clean_state({
-                **current,
-                "reason": reason,
-                "seconds": seconds,
-            })
+            # ----------------------------------------------
+            # IMPORTANT:
+            #
+            # แก้เฉพาะ reason + seconds
+            #
+            # ค่าเหล่านี้ยังคงเดิม:
+            # mode
+            # deadline
+            # commandStartedAt
+            # ----------------------------------------------
+
+            new_state = copy.deepcopy(
+                current
+            )
+
+            new_state["reason"] = (
+                normalize_reason(
+                    reason
+                )
+            )
+
+            new_state["seconds"] = (
+                normalize_seconds(
+                    seconds
+                )
+            )
+
+            new_state = clean_state(
+                new_state
+            )
 
 
             # ------------------------------------------------
@@ -4821,7 +5051,7 @@ def api_save_config():
 
 
             # ------------------------------------------------
-            # DB success -> RAM
+            # DB confirmed -> RAM
             # ------------------------------------------------
 
             with LOCK:
@@ -4833,8 +5063,25 @@ def api_save_config():
                 )
 
 
-        save_local_backup()
+        # ----------------------------------------------------
+        # Backup after DB success
+        # ----------------------------------------------------
 
+        backup_ok, backup_error = (
+            save_local_backup()
+        )
+
+        if not backup_ok:
+
+            LOG.warning(
+                "Config DB saved but backup failed: %s",
+                backup_error,
+            )
+
+
+        # ----------------------------------------------------
+        # Return freshly generated snapshot
+        # ----------------------------------------------------
 
         return jsonify({
             "ok": True,
