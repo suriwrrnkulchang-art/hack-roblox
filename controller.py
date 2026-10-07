@@ -28,7 +28,7 @@ from waitress import serve
 #   control_state
 #
 # Required columns:
-#   place_id   text   (PRIMARY KEY or UNIQUE is strongly recommended)
+#   place_id   text   (PRIMARY KEY or UNIQUE is REQUIRED for upsert)
 #   mode       text
 #   reason     text
 #   deadline   double precision / numeric / nullable
@@ -61,8 +61,8 @@ def env_required(name: str) -> str:
     return value
 
 
-ADMIN_PASSWORD = env_required("991675788")
-TOKEN_PIN = env_required("6155045")
+ADMIN_PASSWORD = env_required("6155045")
+TOKEN_PIN = env_required("991675788")
 SUPABASE_URL = env_required("https://roiuyoflkmftbxtdeuax.supabase.co").rstrip("/")
 SUPABASE_KEY = env_required("sb_publishable_u3rUgrL7oM5FoolIFy0ocA_MsyiuPoh")
 
@@ -91,9 +91,19 @@ MAPS = {
 PLACE_IDS = tuple(MAPS.values())
 SYSTEM_TOKEN_ID = "__SYS_TOKEN__"
 
+# LOCK       : protects the in-memory DATA only (never held during network I/O)
+# WRITE_LOCK : serialises database writes so slow Supabase calls
+#              never block readers (e.g. Roblox polling)
 LOCK = threading.RLock()
+WRITE_LOCK = threading.Lock()
 DB_AVAILABLE = False
 LAST_DB_SYNC = None
+
+# Database load state. If Supabase is unreachable at boot, loading is
+# retried automatically (see ensure_db_loaded) instead of staying broken.
+INITIALIZED = False
+INIT_LOCK = threading.Lock()
+LAST_INIT_ATTEMPT = 0.0
 
 
 # -------------------- Flask --------------------
@@ -138,7 +148,7 @@ def supabase_headers(prefer=None):
     return headers
 
 
-def supabase_request(method, path, payload=None, query=None, timeout=8):
+def supabase_request(method, path, payload=None, query=None, timeout=8, prefer=None):
     """
     Small REST client using urllib only.
     Raises RuntimeError on HTTP/network/JSON errors.
@@ -155,7 +165,7 @@ def supabase_request(method, path, payload=None, query=None, timeout=8):
     req = urllib.request.Request(
         url,
         data=body,
-        headers=supabase_headers(),
+        headers=supabase_headers(prefer),
         method=method.upper(),
     )
 
@@ -189,7 +199,7 @@ def load_from_supabase():
     """
     Loads the complete control_state table.
     Returns:
-        {"token": str, "places": {...}}
+        {"token": str, "places": {...}, "missing": [place_id, ...]}
     """
     global DB_AVAILABLE, LAST_DB_SYNC
 
@@ -210,6 +220,8 @@ def load_from_supabase():
         "places": {},
     }
 
+    found = set()
+
     for row in rows:
         place_id = str(row.get("place_id", ""))
 
@@ -221,6 +233,8 @@ def load_from_supabase():
 
         if place_id not in PLACE_IDS:
             continue
+
+        found.add(place_id)
 
         mode = row.get("mode") or "open"
         if mode not in {"open", "scheduled", "closed"}:
@@ -248,6 +262,9 @@ def load_from_supabase():
             "deadline": deadline,
             "seconds": seconds,
         }
+
+    # Rows that really do not exist in the database yet.
+    result["missing"] = [pid for pid in PLACE_IDS if pid not in found]
 
     for pid in PLACE_IDS:
         result["places"].setdefault(pid, default_state())
@@ -278,14 +295,16 @@ def save_to_supabase(place_id, state_data):
             "seconds": int(state_data.get("seconds", 60)),
         }
 
-    # PostgREST upsert. place_id must be PRIMARY KEY/UNIQUE for
-    # conflict resolution to work correctly.
+    # PostgREST upsert. place_id must be PRIMARY KEY/UNIQUE, and the
+    # "Prefer: resolution=merge-duplicates" header is REQUIRED, otherwise
+    # existing rows are rejected with HTTP 409 (duplicate key).
     result = supabase_request(
         "POST",
         "control_state",
         payload=payload,
         query={"on_conflict": "place_id"},
         timeout=8,
+        prefer="resolution=merge-duplicates,return=minimal",
     )
 
     return result
@@ -322,47 +341,84 @@ def initialize_database():
     """
     Load existing data. If individual map rows are missing, create them.
     If the token row is missing, generate one and persist it.
+
+    Returns True only when the database state was fully loaded.
     """
-    global DATA
+    global DB_AVAILABLE, INITIALIZED
 
     try:
         loaded = load_from_supabase()
     except Exception as exc:
         DB_AVAILABLE = False
-        LOG.error("Initial Supabase load failed: %s", exc)
+        LOG.error("Supabase load failed: %s", exc)
         LOG.error(
-            "The service will start with safe defaults, but saving will "
-            "remain unavailable until Supabase is reachable."
+            "The service will use safe defaults and retry loading "
+            "automatically until Supabase is reachable."
         )
-        return
+        return False
 
-    DATA["places"].update(loaded["places"])
+    with LOCK:
+        DATA["places"].update(loaded["places"])
+        if loaded.get("token"):
+            DATA["token"] = loaded["token"]
 
-    if loaded.get("token"):
-        DATA["token"] = loaded["token"]
-    else:
-        DATA["token"] = secrets.token_urlsafe(32)
+    if not DATA.get("token"):
+        new_token = secrets.token_urlsafe(32)
         ok, err = save_with_retry(
             SYSTEM_TOKEN_ID,
-            {"token": DATA["token"]},
+            {"token": new_token},
         )
         if not ok:
+            # Never keep an unsaved token in memory: after a restart it
+            # would silently change. Try again later.
             LOG.error("Could not save initial API token: %s", err)
+            return False
 
-    for pid in PLACE_IDS:
-        if pid not in loaded["places"]:
-            state = default_state()
-            ok, err = save_with_retry(pid, state)
-            if ok:
+        with LOCK:
+            DATA["token"] = new_token
+
+    for pid in loaded.get("missing", []):
+        state = default_state()
+        ok, err = save_with_retry(pid, state)
+        if ok:
+            with LOCK:
                 DATA["places"][pid] = state
-            else:
-                LOG.error(
-                    "Could not initialize %s: %s",
-                    pid,
-                    err,
-                )
+        else:
+            LOG.error(
+                "Could not initialize %s: %s",
+                pid,
+                err,
+            )
 
+    INITIALIZED = True
     LOG.info("Database initialization complete.")
+    return True
+
+
+def ensure_db_loaded():
+    """
+    If the first load failed (e.g. Supabase was down at boot), retry at
+    most every 5 seconds. Only one thread attempts it; the others
+    continue immediately without waiting.
+    """
+    global LAST_INIT_ATTEMPT
+
+    if INITIALIZED:
+        return
+
+    if time.time() - LAST_INIT_ATTEMPT < 5:
+        return
+
+    if not INIT_LOCK.acquire(blocking=False):
+        return
+
+    try:
+        if INITIALIZED:
+            return
+        LAST_INIT_ATTEMPT = time.time()
+        initialize_database()
+    finally:
+        INIT_LOCK.release()
 
 
 # ============================================================
@@ -411,71 +467,96 @@ def reconcile_state_locked(place_id):
     return False
 
 
+def persist_transition(place_id):
+    """
+    Persist a scheduled->closed transition in the background.
+    If an admin update is currently running, it already saves the
+    latest state, so we simply skip.
+    """
+    if not WRITE_LOCK.acquire(blocking=False):
+        return
+
+    try:
+        with LOCK:
+            current = copy.deepcopy(DATA["places"][place_id])
+
+        ok, err = save_with_retry(place_id, current, retries=2)
+        if not ok:
+            LOG.error(
+                "Could not persist scheduled->closed transition for %s: %s",
+                place_id,
+                err,
+            )
+    finally:
+        WRITE_LOCK.release()
+
+
 def snapshot(place_id):
-    global LAST_DB_SYNC
+    ensure_db_loaded()
 
     with LOCK:
         changed = reconcile_state_locked(place_id)
         state = copy.deepcopy(DATA["places"][place_id])
 
-        # If the scheduled transition happened during a request,
-        # persist it. Failure does not prevent Roblox from receiving
-        # the correct closed state; it only means persistence is pending.
-        if changed:
-            ok, err = save_with_retry(place_id, state, retries=2)
-            if not ok:
-                LOG.error(
-                    "Could not persist scheduled->closed transition for %s: %s",
-                    place_id,
-                    err,
-                )
+    # Roblox receives the correct closed state immediately; persistence
+    # happens in the background and never blocks the request.
+    if changed:
+        threading.Thread(
+            target=persist_transition,
+            args=(place_id,),
+            daemon=True,
+        ).start()
 
-        now = time.time()
+    now = time.time()
 
-        state["serverNow"] = now
-        state["dbAvailable"] = DB_AVAILABLE
-        state["lastDbSync"] = LAST_DB_SYNC
+    state["serverNow"] = now
+    state["dbAvailable"] = DB_AVAILABLE
+    state["lastDbSync"] = LAST_DB_SYNC
 
-        # Client-friendly derived values.
-        if state["mode"] == "scheduled" and state["deadline"] is not None:
-            state["startedAt"] = float(state["deadline"]) - state["seconds"]
-            state["remaining"] = max(
-                0,
-                float(state["deadline"]) - now,
-            )
-            state["elapsed"] = min(
-                state["seconds"],
-                max(0, now - state["startedAt"]),
-            )
-        elif state["mode"] == "closed" and state["deadline"] is not None:
-            state["closedAt"] = float(state["deadline"])
-            state["closedElapsed"] = max(
-                0,
-                now - float(state["deadline"]),
-            )
-            state["remaining"] = 0
-            state["elapsed"] = state["seconds"]
-        else:
-            state["remaining"] = 0
-            state["elapsed"] = 0
+    # Client-friendly derived values.
+    if state["mode"] == "scheduled" and state["deadline"] is not None:
+        state["startedAt"] = float(state["deadline"]) - state["seconds"]
+        state["remaining"] = max(
+            0,
+            float(state["deadline"]) - now,
+        )
+        state["elapsed"] = min(
+            state["seconds"],
+            max(0, now - state["startedAt"]),
+        )
+    elif state["mode"] == "closed" and state["deadline"] is not None:
+        state["closedAt"] = float(state["deadline"])
+        state["closedElapsed"] = max(
+            0,
+            now - float(state["deadline"]),
+        )
+        state["remaining"] = 0
+        state["elapsed"] = state["seconds"]
+    else:
+        state["remaining"] = 0
+        state["elapsed"] = 0
 
-        return state
+    return state
 
 
 def update_state(place_id, mode=None, reason=None, seconds=None):
     """
-    Atomic in-memory update followed by persistent save.
+    Build the new state, save it to Supabase (without holding LOCK),
+    and only then publish it to memory.
 
-    The old state is restored if Supabase cannot save the new state.
+    Memory never contains an unsaved state, so no rollback is needed and
+    slow database calls never block readers.
     """
     if place_id not in PLACE_IDS:
         raise ValueError("unknown place")
 
-    with LOCK:
-        reconcile_state_locked(place_id)
+    if mode is not None and mode not in {"open", "scheduled", "closed"}:
+        raise ValueError("invalid mode")
 
-        old_state = copy.deepcopy(DATA["places"][place_id])
-        new_state = copy.deepcopy(old_state)
+    with WRITE_LOCK:
+        with LOCK:
+            reconcile_state_locked(place_id)
+            new_state = copy.deepcopy(DATA["places"][place_id])
 
         if reason is not None:
             normalized_reason = normalize_reason(reason)
@@ -486,9 +567,6 @@ def update_state(place_id, mode=None, reason=None, seconds=None):
             new_state["seconds"] = normalize_seconds(seconds)
 
         if mode is not None:
-            if mode not in {"open", "scheduled", "closed"}:
-                raise ValueError("invalid mode")
-
             new_state["mode"] = mode
 
             if mode == "scheduled":
@@ -514,18 +592,31 @@ def update_state(place_id, mode=None, reason=None, seconds=None):
         ok, error = save_with_retry(place_id, new_state)
 
         if not ok:
-            DATA["places"][place_id] = old_state
             raise RuntimeError(
                 f"บันทึกฐานข้อมูลไม่สำเร็จ: {error}"
             )
 
-        DATA["places"][place_id] = new_state
-        return snapshot(place_id)
+        with LOCK:
+            DATA["places"][place_id] = new_state
+
+    return snapshot(place_id)
 
 
 # ============================================================
 # Authentication
 # ============================================================
+
+def safe_equal(a, b):
+    """
+    Constant-time comparison on bytes.
+    secrets.compare_digest on str raises TypeError for non-ASCII text,
+    which would turn odd input into a 500 error.
+    """
+    return secrets.compare_digest(
+        str(a or "").encode("utf-8"),
+        str(b or "").encode("utf-8"),
+    )
+
 
 def logged_in():
     return session.get("admin_authenticated") is True
@@ -544,8 +635,7 @@ def login_required(view):
 
 
 def verify_token_pin(value):
-    supplied = str(value or "")
-    return secrets.compare_digest(supplied, TOKEN_PIN)
+    return safe_equal(value, TOKEN_PIN)
 
 
 # ============================================================
@@ -1133,8 +1223,9 @@ async function api(url, options={}) {
     return data;
 }
 
-async function loadSelected() {
-    if (busy) return;
+// force=true is used right after an action, while busy is still true.
+async function loadSelected(force=false) {
+    if (busy && !force) return;
 
     const pid = $("mapSelect").value;
 
@@ -1238,7 +1329,7 @@ async function saveConfig() {
         });
 
         notify(data.message || "บันทึกข้อมูลสำเร็จ");
-        await loadSelected();
+        await loadSelected(true);
     } catch (err) {
         notify("บันทึกไม่สำเร็จ: " + err.message, false);
     } finally {
@@ -1282,7 +1373,7 @@ async function actionSelected(action) {
         });
 
         notify(data.message || "คำสั่งถูกบันทึกแล้ว");
-        await loadSelected();
+        await loadSelected(true);
     } catch (err) {
         notify("ทำรายการไม่สำเร็จ: " + err.message, false);
     } finally {
@@ -1322,7 +1413,7 @@ async function actionAll(action) {
         });
 
         notify(data.message || "บันทึกทุกแมพสำเร็จ");
-        await loadSelected();
+        await loadSelected(true);
     } catch (err) {
         notify("ทำรายการไม่สำเร็จ: " + err.message, false);
     } finally {
@@ -1407,7 +1498,7 @@ def dashboard():
     if request.method == "POST":
         supplied = request.form.get("password", "")
 
-        if secrets.compare_digest(supplied, ADMIN_PASSWORD):
+        if safe_equal(supplied, ADMIN_PASSWORD):
             session.clear()
             session["admin_authenticated"] = True
             session.permanent = True
@@ -1621,6 +1712,8 @@ def api_token():
     if not verify_token_pin(pin):
         return jsonify({"error": "invalid pin"}), 401
 
+    ensure_db_loaded()
+
     with LOCK:
         if not DATA.get("token"):
             return jsonify({"error": "token unavailable"}), 503
@@ -1640,8 +1733,11 @@ def api_new_token():
     if not verify_token_pin(pin):
         return jsonify({"error": "invalid pin"}), 401
 
-    with LOCK:
-        old_token = DATA.get("token")
+    ensure_db_loaded()
+
+    # Save first (outside LOCK so readers are never blocked by a slow
+    # database), publish to memory only after Supabase accepted it.
+    with WRITE_LOCK:
         new_token = secrets.token_urlsafe(32)
 
         ok, error = save_with_retry(
@@ -1651,20 +1747,20 @@ def api_new_token():
         )
 
         if not ok:
-            DATA["token"] = old_token
             return jsonify({
                 "error": f"ไม่สามารถบันทึก Token ใหม่ได้: {error}",
                 "success": False,
             }), 503
 
-        DATA["token"] = new_token
+        with LOCK:
+            DATA["token"] = new_token
 
-        LOG.warning("Admin generated a new Roblox API token.")
+    LOG.warning("Admin generated a new Roblox API token.")
 
-        return jsonify({
-            "success": True,
-            "token": new_token,
-        })
+    return jsonify({
+        "success": True,
+        "token": new_token,
+    })
 
 
 # ============================================================
@@ -1686,13 +1782,15 @@ def roblox_state(place_id):
     if place_id not in PLACE_IDS:
         return jsonify({"error": "unknown place"}), 404
 
-    supplied = request.headers.get("Authorization", "")
-    expected = f"Bearer {DATA.get('token', '')}"
+    ensure_db_loaded()
 
-    if not DATA.get("token"):
+    supplied = request.headers.get("Authorization", "")
+    token = DATA.get("token")
+
+    if not token:
         return jsonify({"error": "service unavailable"}), 503
 
-    if not secrets.compare_digest(supplied, expected):
+    if not safe_equal(supplied, f"Bearer {token}"):
         return jsonify({"error": "unauthorized"}), 401
 
     result = snapshot(place_id)
@@ -1724,7 +1822,9 @@ def startup():
     if DATA.get("token"):
         LOG.info("API token loaded successfully.")
     else:
-        LOG.error("API token is unavailable.")
+        LOG.error(
+            "API token is unavailable. Loading will be retried automatically."
+        )
 
     LOG.info("Startup complete.")
 
