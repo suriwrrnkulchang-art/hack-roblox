@@ -1,3947 +1,1743 @@
 import copy
 import json
+import logging
 import os
 import secrets
 import threading
 import time
-import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+import urllib.parse
+import urllib.request
+from functools import wraps
 
-from flask import (
-    Flask,
-    jsonify,
-    redirect,
-    render_template_string,
-    request,
-    session,
-    url_for,
-)
+from flask import Flask, jsonify, redirect, render_template_string, request, session
 from waitress import serve
 
 
 # ============================================================
-# CONFIG
+# Roblox Control Center - Stable Edition
+# ============================================================
+# Required Render Environment Variables:
+#   ADMIN_PASSWORD
+#   TOKEN_PIN
+#   SECRET_KEY
+#   SUPABASE_URL
+#   SUPABASE_KEY
+#
+# Existing Supabase table:
+#   control_state
+#
+# Required columns:
+#   place_id   text   (PRIMARY KEY or UNIQUE is strongly recommended)
+#   mode       text
+#   reason     text
+#   deadline   double precision / numeric / nullable
+#   seconds    integer / nullable
+#
+# The code intentionally keeps the existing API:
+#   GET /state/<place_id>       Roblox API
+#   GET /api/state/<place_id>   Dashboard API
+#   POST /api/update
+#   POST /api/update-all
+#   POST /api/save-config
 # ============================================================
 
+
+# -------------------- Logging --------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+LOG = logging.getLogger("roblox-control-center")
+
+
+# -------------------- Environment --------------------
+def env_required(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"Missing required environment variable: {name}"
+        )
+    return value
+
+
+ADMIN_PASSWORD = env_required("6155045")
+TOKEN_PIN = env_required("6155045")
+SUPABASE_URL = env_required("https://roiuyoflkmftbxtdeuax.supabase.co").rstrip("/")
+SUPABASE_KEY = env_required("sb_publishable_u3rUgrL7oM5FoolIFy0ocA_MsyiuPoh")
+
+# A stable SECRET_KEY is important for Flask sessions.
+# Generate one locally with:
+# python -c "import secrets; print(secrets.token_hex(32))"
+SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    raise RuntimeError(
+        "Missing SECRET_KEY. Add a long random value to Render Environment."
+    )
+
+
+# -------------------- Server --------------------
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", "8888"))
 
-# ------------------------------------------------------------
-# Security
-# ------------------------------------------------------------
-# อย่าใส่รหัสจริงลงใน source code
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "6155045")
-TOKEN_PIN = os.environ.get("TOKEN_PIN", "991675788")
-
-if not ADMIN_PASSWORD:
-    raise RuntimeError(
-        "กรุณาตั้ง Environment Variable: ADMIN_PASSWORD"
-    )
-
-if not TOKEN_PIN:
-    raise RuntimeError(
-        "กรุณาตั้ง Environment Variable: TOKEN_PIN"
-    )
-
-# ------------------------------------------------------------
-# Supabase
-# ------------------------------------------------------------
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://roiuyoflkmftbxtdeuax.supabase.co").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_publishable_u3rUgrL7oM5FoolIFy0ocA_MsyiuPoh")
-
-if not SUPABASE_URL:
-    raise RuntimeError(
-        "กรุณาตั้ง Environment Variable: SUPABASE_URL"
-    )
-
-if not SUPABASE_KEY:
-    raise RuntimeError(
-        "กรุณาตั้ง Environment Variable: SUPABASE_KEY"
-    )
-
-# ------------------------------------------------------------
-# Maps
-# ------------------------------------------------------------
+# Never expose secrets in logs.
+DEFAULT_REASON = "เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง"
 
 MAPS = {
     "Place 1": "120651982896178",
     "Place 2": "77210125175879",
 }
 
-DEFAULT_REASON = "เซิร์ฟเวอร์ปิดปรับปรุง กรุณาเข้าใหม่ภายหลัง"
-DEFAULT_SECONDS = 60
-
-# จำกัดเวลาไม่ให้กรอกค่าผิดปกติ
-MIN_SECONDS = 1
-MAX_SECONDS = 7 * 24 * 60 * 60
-
-# ------------------------------------------------------------
-# Local backup
-# ------------------------------------------------------------
-
-BACKUP_FILE = os.environ.get(
-    "CONTROL_BACKUP_FILE",
-    "control_backup.json"
-)
-
-# ------------------------------------------------------------
-# Runtime
-# ------------------------------------------------------------
-
-LOCK = threading.RLock()
-
-SUPABASE_TIMEOUT = 8
-SUPABASE_RETRIES = 3
-
-DATA = {
-    "token": None,
-    "places": {},
-}
-
+PLACE_IDS = tuple(MAPS.values())
 SYSTEM_TOKEN_ID = "__SYS_TOKEN__"
 
+LOCK = threading.RLock()
+DB_AVAILABLE = False
+LAST_DB_SYNC = None
 
-# ============================================================
-# DEFAULT STATE
-# ============================================================
 
+# -------------------- Flask --------------------
+app = Flask(__name__)
+app.secret_key = SECRET_KEY
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "1") == "1",
+    MAX_CONTENT_LENGTH=1024 * 1024,
+)
+
+
+# -------------------- In-memory state --------------------
 def default_state():
     return {
         "mode": "open",
         "reason": DEFAULT_REASON,
         "deadline": None,
-        "seconds": DEFAULT_SECONDS,
+        "seconds": 60,
     }
 
 
-# ============================================================
-# UTILITY
-# ============================================================
-
-def now_ts():
-    return time.time()
-
-
-def iso_time(timestamp):
-    if not timestamp:
-        return None
-
-    try:
-        return datetime.fromtimestamp(
-            float(timestamp),
-            tz=timezone.utc
-        ).isoformat()
-    except Exception:
-        return None
-
-
-def safe_int(value, default=DEFAULT_SECONDS):
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        return default
-
-    return max(MIN_SECONDS, min(MAX_SECONDS, value))
-
-
-def normalize_reason(reason):
-    if reason is None:
-        return DEFAULT_REASON
-
-    reason = str(reason).strip()
-
-    if not reason:
-        return DEFAULT_REASON
-
-    # ป้องกันข้อความยาวเกินจำเป็น
-    return reason[:500]
-
-
-def make_backup_data():
-    return {
-        "token": DATA["token"],
-        "places": copy.deepcopy(DATA["places"]),
-    }
+DATA = {
+    "token": None,
+    "places": {pid: default_state() for pid in PLACE_IDS},
+}
 
 
 # ============================================================
-# LOCAL BACKUP
+# Supabase REST
 # ============================================================
 
-def save_local_backup():
-    """
-    บันทึก backup แบบ atomic
-
-    เขียนไฟล์ temporary ก่อน
-    แล้วค่อย os.replace()
-
-    ทำให้โอกาสไฟล์ JSON เสียระหว่างเขียนลดลงมาก
-    """
-
-    temp_file = BACKUP_FILE + ".tmp"
-
-    try:
-        payload = make_backup_data()
-
-        with open(
-            temp_file,
-            "w",
-            encoding="utf-8"
-        ) as f:
-            json.dump(
-                payload,
-                f,
-                ensure_ascii=False,
-                indent=2
-            )
-            f.flush()
-            os.fsync(f.fileno())
-
-        os.replace(temp_file, BACKUP_FILE)
-
-        return True
-
-    except Exception as exc:
-        print(f"[LOCAL BACKUP ERROR] {exc}")
-
-        try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        except Exception:
-            pass
-
-        return False
-
-
-def load_local_backup():
-    try:
-        if not os.path.exists(BACKUP_FILE):
-            return None
-
-        with open(
-            BACKUP_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-            data = json.load(f)
-
-        if not isinstance(data, dict):
-            return None
-
-        return data
-
-    except Exception as exc:
-        print(f"[LOCAL LOAD ERROR] {exc}")
-        return None
-
-
-# ============================================================
-# SUPABASE HTTP
-# ============================================================
-
-def supabase_request(
-    method,
-    endpoint,
-    payload=None,
-    query="",
-    timeout=SUPABASE_TIMEOUT
-):
-    url = f"{SUPABASE_URL}/rest/v1/{endpoint}"
-
-    if query:
-        url += "?" + query
-
+def supabase_headers(prefer=None):
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Accept": "application/json",
     }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
 
-    data = None
 
+def supabase_request(method, path, payload=None, query=None, timeout=8):
+    """
+    Small REST client using urllib only.
+    Raises RuntimeError on HTTP/network/JSON errors.
+    """
+    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
+
+    if query:
+        url += "?" + urllib.parse.urlencode(query, doseq=True)
+
+    body = None
     if payload is not None:
-        data = json.dumps(
-            payload,
-            ensure_ascii=False
-        ).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
     req = urllib.request.Request(
         url,
-        data=data,
-        headers=headers,
-        method=method,
+        data=body,
+        headers=supabase_headers(),
+        method=method.upper(),
     )
 
-    with urllib.request.urlopen(
-        req,
-        timeout=timeout
-    ) as response:
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+            if not raw:
+                return None
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return raw
 
-        raw = response.read()
-
-        if not raw:
-            return True, None
-
+    except urllib.error.HTTPError as exc:
         try:
-            return True, json.loads(
-                raw.decode("utf-8")
-            )
-        except json.JSONDecodeError:
-            return True, None
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
 
+        raise RuntimeError(
+            f"Supabase HTTP {exc.code}: {detail[:800]}"
+        ) from exc
 
-# ============================================================
-# LOAD FROM SUPABASE
-# ============================================================
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError(
+            f"Supabase connection failed: {exc}"
+        ) from exc
+
 
 def load_from_supabase():
     """
-    โหลดข้อมูลจาก Supabase
-
-    สำคัญ:
-    ถ้า Supabase ติดต่อไม่ได้ จะ return None
-    และระบบจะไม่สร้างค่า default ไปทับข้อมูลเดิม
+    Loads the complete control_state table.
+    Returns:
+        {"token": str, "places": {...}}
     """
+    global DB_AVAILABLE, LAST_DB_SYNC
 
-    for attempt in range(1, SUPABASE_RETRIES + 1):
+    rows = supabase_request(
+        "GET",
+        "control_state",
+        query={
+            "select": "place_id,mode,reason,deadline,seconds",
+        },
+        timeout=8,
+    )
 
-        try:
-            ok, data = supabase_request(
-                "GET",
-                "control_state",
-                query="select=*"
-            )
+    if not isinstance(rows, list):
+        raise RuntimeError("Supabase returned an unexpected response.")
 
-            if not ok:
-                raise RuntimeError("Supabase request failed")
-
-            if not isinstance(data, list):
-                raise RuntimeError(
-                    "Supabase returned invalid data"
-                )
-
-            token = None
-            places = {}
-
-            for row in data:
-
-                place_id = row.get("place_id")
-
-                if not place_id:
-                    continue
-
-                if place_id == SYSTEM_TOKEN_ID:
-                    token = row.get("reason")
-                    continue
-
-                if place_id not in MAPS.values():
-                    continue
-
-                places[place_id] = {
-                    "mode": row.get("mode") or "open",
-                    "reason": normalize_reason(
-                        row.get("reason")
-                    ),
-                    "deadline": row.get("deadline"),
-                    "seconds": safe_int(
-                        row.get("seconds"),
-                        DEFAULT_SECONDS
-                    ),
-                }
-
-            return {
-                "token": token,
-                "places": places,
-            }
-
-        except Exception as exc:
-
-            print(
-                f"[SUPABASE LOAD] "
-                f"attempt {attempt}/{SUPABASE_RETRIES}: {exc}"
-            )
-
-            if attempt < SUPABASE_RETRIES:
-                time.sleep(0.5 * attempt)
-
-    return None
-
-
-# ============================================================
-# SAVE ONE RECORD TO SUPABASE
-# ============================================================
-
-def save_record_to_supabase(
-    place_id,
-    state_data
-):
-    """
-    UPSERT โดยใช้ place_id เป็น conflict key
-
-    ต้องมี UNIQUE หรือ PRIMARY KEY ที่ place_id
-    """
-
-    payload = {
-        "place_id": place_id,
-        "mode": state_data.get("mode"),
-        "reason": state_data.get("reason"),
-        "deadline": state_data.get("deadline"),
-        "seconds": state_data.get(
-            "seconds",
-            DEFAULT_SECONDS
-        ),
+    result = {
+        "token": None,
+        "places": {},
     }
 
-    for attempt in range(1, SUPABASE_RETRIES + 1):
+    for row in rows:
+        place_id = str(row.get("place_id", ""))
 
+        if place_id == SYSTEM_TOKEN_ID:
+            token = row.get("reason")
+            if token:
+                result["token"] = str(token)
+            continue
+
+        if place_id not in PLACE_IDS:
+            continue
+
+        mode = row.get("mode") or "open"
+        if mode not in {"open", "scheduled", "closed"}:
+            mode = "open"
+
+        reason = row.get("reason") or DEFAULT_REASON
+
+        raw_seconds = row.get("seconds", 60)
         try:
+            seconds = int(raw_seconds)
+        except (TypeError, ValueError):
+            seconds = 60
 
-            ok, _ = supabase_request(
-                "POST",
-                "control_state",
-                payload=payload,
-                query="on_conflict=place_id",
-            )
+        seconds = max(1, min(seconds, 86400))
 
-            if ok:
-                return True
+        deadline = row.get("deadline")
+        try:
+            deadline = float(deadline) if deadline is not None else None
+        except (TypeError, ValueError):
+            deadline = None
 
+        result["places"][place_id] = {
+            "mode": mode,
+            "reason": str(reason)[:500],
+            "deadline": deadline,
+            "seconds": seconds,
+        }
+
+    for pid in PLACE_IDS:
+        result["places"].setdefault(pid, default_state())
+
+    DB_AVAILABLE = True
+    LAST_DB_SYNC = time.time()
+    return result
+
+
+def save_to_supabase(place_id, state_data):
+    """
+    Upserts one row and verifies that Supabase accepted it.
+    """
+    if place_id == SYSTEM_TOKEN_ID:
+        payload = {
+            "place_id": SYSTEM_TOKEN_ID,
+            "mode": "token",
+            "reason": str(state_data["token"]),
+            "deadline": None,
+            "seconds": 0,
+        }
+    else:
+        payload = {
+            "place_id": place_id,
+            "mode": state_data.get("mode", "open"),
+            "reason": state_data.get("reason", DEFAULT_REASON),
+            "deadline": state_data.get("deadline"),
+            "seconds": int(state_data.get("seconds", 60)),
+        }
+
+    # PostgREST upsert. place_id must be PRIMARY KEY/UNIQUE for
+    # conflict resolution to work correctly.
+    result = supabase_request(
+        "POST",
+        "control_state",
+        payload=payload,
+        query={"on_conflict": "place_id"},
+        timeout=8,
+    )
+
+    return result
+
+
+def save_with_retry(place_id, state_data, retries=3):
+    global DB_AVAILABLE, LAST_DB_SYNC
+
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            save_to_supabase(place_id, state_data)
+            DB_AVAILABLE = True
+            LAST_DB_SYNC = time.time()
+            return True, None
         except Exception as exc:
-
-            print(
-                f"[SUPABASE SAVE] "
-                f"{place_id} "
-                f"attempt {attempt}/{SUPABASE_RETRIES}: {exc}"
+            last_error = str(exc)
+            LOG.warning(
+                "Supabase save failed (%s/%s) for %s: %s",
+                attempt,
+                retries,
+                place_id,
+                last_error,
             )
+            if attempt < retries:
+                time.sleep(0.25 * attempt)
 
-        if attempt < SUPABASE_RETRIES:
-            time.sleep(0.5 * attempt)
+    DB_AVAILABLE = False
+    return False, last_error
+
+
+def initialize_database():
+    """
+    Load existing data. If individual map rows are missing, create them.
+    If the token row is missing, generate one and persist it.
+    """
+    global DATA
+
+    try:
+        loaded = load_from_supabase()
+    except Exception as exc:
+        DB_AVAILABLE = False
+        LOG.error("Initial Supabase load failed: %s", exc)
+        LOG.error(
+            "The service will start with safe defaults, but saving will "
+            "remain unavailable until Supabase is reachable."
+        )
+        return
+
+    DATA["places"].update(loaded["places"])
+
+    if loaded.get("token"):
+        DATA["token"] = loaded["token"]
+    else:
+        DATA["token"] = secrets.token_urlsafe(32)
+        ok, err = save_with_retry(
+            SYSTEM_TOKEN_ID,
+            {"token": DATA["token"]},
+        )
+        if not ok:
+            LOG.error("Could not save initial API token: %s", err)
+
+    for pid in PLACE_IDS:
+        if pid not in loaded["places"]:
+            state = default_state()
+            ok, err = save_with_retry(pid, state)
+            if ok:
+                DATA["places"][pid] = state
+            else:
+                LOG.error(
+                    "Could not initialize %s: %s",
+                    pid,
+                    err,
+                )
+
+    LOG.info("Database initialization complete.")
+
+
+# ============================================================
+# State handling
+# ============================================================
+
+def normalize_seconds(value, default=60):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+
+    return max(1, min(number, 86400))
+
+
+def normalize_reason(value):
+    if value is None:
+        return None
+
+    reason = str(value).strip()
+    if not reason:
+        return DEFAULT_REASON
+
+    return reason[:500]
+
+
+def reconcile_state_locked(place_id):
+    """
+    If a scheduled deadline has passed, transition to closed.
+
+    IMPORTANT:
+    We intentionally keep deadline equal to the actual closing timestamp.
+    This lets the dashboard show "ปิดมาแล้ว X" after a restart.
+    Roblox only needs mode=closed, so retaining deadline is harmless.
+    """
+    state = DATA["places"][place_id]
+
+    if (
+        state["mode"] == "scheduled"
+        and state["deadline"] is not None
+        and time.time() >= float(state["deadline"])
+    ):
+        state["mode"] = "closed"
+        return True
 
     return False
 
 
-# ============================================================
-# SAVE STATE SAFELY
-# ============================================================
-
-def persist_state(place_id, state):
-    """
-    บันทึก Supabase ก่อน
-
-    ถ้าสำเร็จ:
-        อัปเดต DATA
-        แล้วสร้าง local backup
-
-    ถ้า Supabase ล้ม:
-        ไม่เปลี่ยน DATA
-        return False
-
-    จุดนี้แก้ปัญหาใหญ่ของโค้ดเดิม:
-    เดิม DATA ถูกเปลี่ยนก่อน แล้วค่อยลอง save
-    """
-
-    if not save_record_to_supabase(
-        place_id,
-        state
-    ):
-        return False
-
-    DATA["places"][place_id] = copy.deepcopy(state)
-
-    # Local backup เป็นชั้นสำรอง
-    save_local_backup()
-
-    return True
-
-
-# ============================================================
-# INITIALIZE DATA
-# ============================================================
-
-def initialize_data():
-
-    remote = load_from_supabase()
-
-    local = load_local_backup()
-
-    # --------------------------------------------------------
-    # Remote สำเร็จ
-    # --------------------------------------------------------
-
-    if remote is not None:
-
-        print("[STARTUP] Loaded from Supabase")
-
-        token = remote.get("token")
-
-        if not token:
-            token = secrets.token_urlsafe(32)
-
-            save_record_to_supabase(
-                SYSTEM_TOKEN_ID,
-                {
-                    "mode": "token",
-                    "reason": token,
-                    "deadline": None,
-                    "seconds": DEFAULT_SECONDS,
-                }
-            )
-
-        DATA["token"] = token
-
-        for place_id in MAPS.values():
-
-            state = remote["places"].get(
-                place_id
-            )
-
-            if state is None:
-
-                state = default_state()
-
-                if save_record_to_supabase(
-                    place_id,
-                    state
-                ):
-                    print(
-                        f"[STARTUP] Created missing "
-                        f"state: {place_id}"
-                    )
-
-            DATA["places"][place_id] = state
-
-        save_local_backup()
-
-        return
-
-    # --------------------------------------------------------
-    # Supabase ล่ม → ใช้ Local Backup
-    # --------------------------------------------------------
-
-    print(
-        "[STARTUP] Supabase unavailable. "
-        "Trying local backup..."
-    )
-
-    if local is not None:
-
-        DATA["token"] = (
-            local.get("token")
-            or secrets.token_urlsafe(32)
-        )
-
-        local_places = local.get(
-            "places",
-            {}
-        )
-
-        for place_id in MAPS.values():
-
-            DATA["places"][place_id] = copy.deepcopy(
-                local_places.get(
-                    place_id,
-                    default_state()
-                )
-            )
-
-        print(
-            "[STARTUP] Local backup loaded."
-        )
-
-        return
-
-    # --------------------------------------------------------
-    # ไม่มีทั้ง Remote และ Local
-    #
-    # สร้างค่าใหม่ได้เฉพาะกรณีนี้
-    # --------------------------------------------------------
-
-    print(
-        "[STARTUP] No database/backup found. "
-        "Creating fresh state."
-    )
-
-    DATA["token"] = secrets.token_urlsafe(32)
-
-    for place_id in MAPS.values():
-        DATA["places"][place_id] = default_state()
-
-    # พยายามสร้างข้อมูลใน Supabase
-    save_record_to_supabase(
-        SYSTEM_TOKEN_ID,
-        {
-            "mode": "token",
-            "reason": DATA["token"],
-            "deadline": None,
-            "seconds": DEFAULT_SECONDS,
-        }
-    )
-
-    for place_id in MAPS.values():
-        save_record_to_supabase(
-            place_id,
-            DATA["places"][place_id]
-        )
-
-    save_local_backup()
-
-
-initialize_data()
-
-
-# ============================================================
-# STATE LOGIC
-# ============================================================
-
-def reconcile_locked():
-    """
-    ตรวจ scheduled ที่หมดเวลา
-
-    ไม่บันทึกทุก request ถ้าไม่มีการเปลี่ยนแปลง
-    """
-
-    current = now_ts()
-
-    for place_id, state in DATA["places"].items():
-
-        if (
-            state.get("mode") == "scheduled"
-            and state.get("deadline") is not None
-            and current >= float(state["deadline"])
-        ):
-
-            new_state = copy.deepcopy(state)
-
-            new_state["mode"] = "closed"
-            new_state["deadline"] = None
-
-            if save_record_to_supabase(
-                place_id,
-                new_state
-            ):
-
-                DATA["places"][place_id] = new_state
-
-                print(
-                    f"[AUTO CLOSE] {place_id}"
-                )
-
-                save_local_backup()
-
-
 def snapshot(place_id):
+    global LAST_DB_SYNC
 
     with LOCK:
+        changed = reconcile_state_locked(place_id)
+        state = copy.deepcopy(DATA["places"][place_id])
 
-        reconcile_locked()
-
-        state = copy.deepcopy(
-            DATA["places"][place_id]
-        )
-
-        server_now = now_ts()
-
-        result = {
-            **state,
-            "serverNow": server_now,
-            "serverTimeISO": iso_time(server_now),
-        }
-
-        if (
-            state["mode"] == "scheduled"
-            and state.get("deadline") is not None
-        ):
-
-            deadline = float(
-                state["deadline"]
-            )
-
-            seconds_total = safe_int(
-                state.get(
-                    "seconds",
-                    DEFAULT_SECONDS
+        # If the scheduled transition happened during a request,
+        # persist it. Failure does not prevent Roblox from receiving
+        # the correct closed state; it only means persistence is pending.
+        if changed:
+            ok, err = save_with_retry(place_id, state, retries=2)
+            if not ok:
+                LOG.error(
+                    "Could not persist scheduled->closed transition for %s: %s",
+                    place_id,
+                    err,
                 )
-            )
 
-            started_at = (
-                deadline - seconds_total
-            )
+        now = time.time()
 
-            elapsed = max(
+        state["serverNow"] = now
+        state["dbAvailable"] = DB_AVAILABLE
+        state["lastDbSync"] = LAST_DB_SYNC
+
+        # Client-friendly derived values.
+        if state["mode"] == "scheduled" and state["deadline"] is not None:
+            state["startedAt"] = float(state["deadline"]) - state["seconds"]
+            state["remaining"] = max(
                 0,
-                server_now - started_at
+                float(state["deadline"]) - now,
             )
-
-            remaining = max(
+            state["elapsed"] = min(
+                state["seconds"],
+                max(0, now - state["startedAt"]),
+            )
+        elif state["mode"] == "closed" and state["deadline"] is not None:
+            state["closedAt"] = float(state["deadline"])
+            state["closedElapsed"] = max(
                 0,
-                deadline - server_now
+                now - float(state["deadline"]),
             )
-
-            result["startedAt"] = started_at
-            result["startedAtISO"] = iso_time(
-                started_at
-            )
-
-            result["deadlineISO"] = iso_time(
-                deadline
-            )
-
-            result["elapsedSeconds"] = int(
-                elapsed
-            )
-
-            result["remainingSeconds"] = int(
-                remaining
-            )
-
+            state["remaining"] = 0
+            state["elapsed"] = state["seconds"]
         else:
+            state["remaining"] = 0
+            state["elapsed"] = 0
 
-            result["startedAt"] = None
-            result["startedAtISO"] = None
-            result["deadlineISO"] = None
-            result["elapsedSeconds"] = None
-            result["remainingSeconds"] = None
-
-        return result
+        return state
 
 
-def update_state(
-    place_id,
-    mode=None,
-    reason=None,
-    seconds=None
-):
+def update_state(place_id, mode=None, reason=None, seconds=None):
+    """
+    Atomic in-memory update followed by persistent save.
+
+    The old state is restored if Supabase cannot save the new state.
+    """
+    if place_id not in PLACE_IDS:
+        raise ValueError("unknown place")
 
     with LOCK:
+        reconcile_state_locked(place_id)
 
-        if place_id not in DATA["places"]:
-            return False, "unknown place"
-
-        old_state = copy.deepcopy(
-            DATA["places"][place_id]
-        )
-
-        new_state = copy.deepcopy(
-            old_state
-        )
+        old_state = copy.deepcopy(DATA["places"][place_id])
+        new_state = copy.deepcopy(old_state)
 
         if reason is not None:
-            new_state["reason"] = normalize_reason(
-                reason
-            )
+            normalized_reason = normalize_reason(reason)
+            if normalized_reason is not None:
+                new_state["reason"] = normalized_reason
 
         if seconds is not None:
-            new_state["seconds"] = safe_int(
-                seconds
-            )
+            new_state["seconds"] = normalize_seconds(seconds)
 
         if mode is not None:
+            if mode not in {"open", "scheduled", "closed"}:
+                raise ValueError("invalid mode")
 
             new_state["mode"] = mode
 
             if mode == "scheduled":
-
-                duration = safe_int(
-                    seconds
-                    if seconds is not None
-                    else new_state.get(
-                        "seconds",
-                        DEFAULT_SECONDS
-                    )
+                duration = normalize_seconds(
+                    seconds if seconds is not None else new_state["seconds"]
                 )
-
                 new_state["seconds"] = duration
-                new_state["deadline"] = (
-                    now_ts() + duration
+                new_state["deadline"] = time.time() + duration
+
+            elif mode == "closed":
+                # Keep a timestamp so the dashboard can show how long
+                # the server has been closed.
+                new_state["deadline"] = time.time()
+                new_state["seconds"] = max(
+                    1,
+                    int(new_state.get("seconds", 60)),
                 )
 
-            else:
-
+            elif mode == "open":
                 new_state["deadline"] = None
 
-        # ----------------------------------------------------
-        # ตรวจว่ามีการเปลี่ยนแปลงจริงไหม
-        # ----------------------------------------------------
+        # Persist first. Do not tell the browser "success" if DB failed.
+        ok, error = save_with_retry(place_id, new_state)
 
-        if new_state == old_state:
-            return True, "no_change"
-
-        # ----------------------------------------------------
-        # Save ก่อน mutate DATA
-        # ----------------------------------------------------
-
-        if not save_record_to_supabase(
-            place_id,
-            new_state
-        ):
-            return False, "supabase_save_failed"
-
-        # ----------------------------------------------------
-        # Commit memory
-        # ----------------------------------------------------
-
-        DATA["places"][place_id] = new_state
-
-        # ----------------------------------------------------
-        # Backup
-        # ----------------------------------------------------
-
-        backup_ok = save_local_backup()
-
-        if not backup_ok:
-            print(
-                "[WARNING] Supabase saved, "
-                "but local backup failed."
+        if not ok:
+            DATA["places"][place_id] = old_state
+            raise RuntimeError(
+                f"บันทึกฐานข้อมูลไม่สำเร็จ: {error}"
             )
 
-        return True, "saved"
+        DATA["places"][place_id] = new_state
+        return snapshot(place_id)
 
 
 # ============================================================
-# FLASK
+# Authentication
 # ============================================================
 
-app = Flask(__name__)
-
-app.secret_key = os.environ.get(
-    "FLASK_SECRET_KEY"
-)
-
-if not app.secret_key:
-    raise RuntimeError(
-        "กรุณาตั้ง Environment Variable: FLASK_SECRET_KEY"
-    )
-
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    SESSION_COOKIE_SECURE=os.environ.get(
-        "COOKIE_SECURE",
-        "0"
-    ) == "1",
-    PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
-)
+def logged_in():
+    return session.get("admin_authenticated") is True
 
 
-# ============================================================
-# AUTH
-# ============================================================
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not logged_in():
+            if request.path.startswith("/api/"):
+                return jsonify({"error": "unauthorized"}), 401
+            return redirect("/")
+        return view(*args, **kwargs)
 
-def is_admin():
-
-    return session.get(
-        "admin_authenticated",
-        False
-    ) is True
+    return wrapped
 
 
-def admin_required():
-
-    if not is_admin():
-        return jsonify({
-            "success": False,
-            "error": "unauthorized"
-        }), 401
-
-    return None
+def verify_token_pin(value):
+    supplied = str(value or "")
+    return secrets.compare_digest(supplied, TOKEN_PIN)
 
 
 # ============================================================
-# LOGIN HTML
+# HTML - Login
 # ============================================================
 
 LOGIN_HTML = r"""
-<!DOCTYPE html>
+<!doctype html>
 <html lang="th">
 <head>
-<meta charset="UTF-8">
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-
-<title>Roblox Control Center - Login</title>
-
+<title>Login · Roblox Control Center</title>
 <style>
-
-* {
-    box-sizing: border-box;
-}
-
-body {
-    margin: 0;
-    min-height: 100vh;
-
-    display: flex;
-    align-items: center;
-    justify-content: center;
-
-    font-family:
-        Inter,
-        "Segoe UI",
-        Tahoma,
-        sans-serif;
-
-    color: #f5f7ff;
-
+*{box-sizing:border-box}
+body{
+    margin:0;
+    min-height:100vh;
+    display:grid;
+    place-items:center;
+    padding:20px;
+    color:#eef2ff;
     background:
-        radial-gradient(
-            circle at top,
-            #202a4d 0,
-            #0b0f1a 45%,
-            #06080d 100%
-        );
+      radial-gradient(circle at 20% 10%,rgba(99,102,241,.20),transparent 30%),
+      radial-gradient(circle at 80% 90%,rgba(14,165,233,.14),transparent 30%),
+      #070a12;
+    font-family:Inter,Segoe UI,Arial,sans-serif;
 }
-
-.login-card {
-    width: min(420px, calc(100% - 32px));
-
-    padding: 32px;
-
-    border: 1px solid rgba(255,255,255,.08);
-
-    border-radius: 22px;
-
-    background:
-        rgba(17, 22, 36, .92);
-
-    box-shadow:
-        0 30px 80px rgba(0,0,0,.45);
-
-    backdrop-filter: blur(20px);
+.card{
+    width:min(420px,100%);
+    padding:32px;
+    border:1px solid #252b3d;
+    border-radius:24px;
+    background:rgba(15,19,31,.92);
+    box-shadow:0 24px 80px rgba(0,0,0,.45);
 }
-
-.logo {
-    width: 64px;
-    height: 64px;
-
-    margin: 0 auto 20px;
-
-    display: grid;
-    place-items: center;
-
-    border-radius: 18px;
-
-    background:
-        linear-gradient(
-            135deg,
-            #5865f2,
-            #7c3aed
-        );
-
-    font-size: 28px;
-
-    box-shadow:
-        0 15px 35px rgba(88,101,242,.3);
+.logo{
+    width:58px;height:58px;
+    display:grid;place-items:center;
+    border-radius:17px;
+    background:linear-gradient(135deg,#6366f1,#06b6d4);
+    font-size:27px;
+    margin-bottom:20px;
 }
-
-h1 {
-    margin: 0;
-    text-align: center;
-    font-size: 24px;
+h1{margin:0 0 8px;font-size:25px}
+p{color:#8e99ad;margin:0 0 24px}
+label{display:block;font-size:13px;color:#aeb8ca;margin-bottom:8px}
+input{
+    width:100%;height:48px;padding:0 14px;
+    color:#fff;background:#0b0f19;
+    border:1px solid #293147;border-radius:12px;outline:none;
 }
-
-.subtitle {
-    margin: 8px 0 26px;
-    text-align: center;
-    color: #8f9bb5;
-    font-size: 14px;
+input:focus{border-color:#6366f1;box-shadow:0 0 0 3px rgba(99,102,241,.15)}
+button{
+    width:100%;height:48px;margin-top:14px;
+    border:0;border-radius:12px;
+    color:#fff;font-weight:700;cursor:pointer;
+    background:linear-gradient(135deg,#6366f1,#4f46e5);
 }
-
-.input {
-    width: 100%;
-    padding: 14px 15px;
-
-    border: 1px solid #293149;
-    border-radius: 12px;
-
-    background: #0d1220;
-    color: white;
-
-    outline: none;
-
-    font-size: 15px;
+.error{
+    padding:11px 13px;margin-bottom:15px;
+    border-radius:10px;background:#3a1218;color:#ffb4be;
+    border:1px solid #69202c;font-size:13px
 }
-
-.input:focus {
-    border-color: #6675ff;
-
-    box-shadow:
-        0 0 0 3px
-        rgba(102,117,255,.12);
-}
-
-.button {
-    width: 100%;
-
-    margin-top: 14px;
-
-    padding: 14px;
-
-    border: 0;
-    border-radius: 12px;
-
-    color: white;
-
-    background:
-        linear-gradient(
-            135deg,
-            #5865f2,
-            #7c3aed
-        );
-
-    font-weight: 700;
-
-    cursor: pointer;
-
-    transition: .2s;
-}
-
-.button:hover {
-    transform: translateY(-1px);
-    filter: brightness(1.08);
-}
-
-.error {
-    margin-bottom: 15px;
-
-    padding: 12px;
-
-    border: 1px solid rgba(255,80,100,.2);
-    border-radius: 10px;
-
-    color: #ff8f9c;
-
-    background: rgba(255,70,90,.08);
-
-    font-size: 14px;
-}
-
-.footer {
-    margin-top: 20px;
-
-    text-align: center;
-
-    color: #667089;
-
-    font-size: 12px;
-}
-
+.small{margin-top:18px;text-align:center;font-size:12px;color:#657086}
 </style>
 </head>
-
 <body>
-
-<div class="login-card">
-
+<div class="card">
     <div class="logo">🛡️</div>
-
     <h1>Roblox Control Center</h1>
-
-    <div class="subtitle">
-        Secure Server Management Panel
-    </div>
-
-    {% if error %}
-        <div class="error">
-            ⚠️ {{ error }}
-        </div>
-    {% endif %}
-
-    <form method="POST">
-
-        <input
-            class="input"
-            type="password"
-            name="password"
-            placeholder="รหัสผ่านแอดมิน"
-            autocomplete="current-password"
-            required
-            autofocus
-        >
-
-        <button
-            class="button"
-            type="submit"
-        >
-            🔐 เข้าสู่ระบบ
-        </button>
-
+    <p>เข้าสู่ระบบผู้ดูแลระบบ</p>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <form method="post">
+        <label>Admin Password</label>
+        <input type="password" name="password" autocomplete="current-password"
+               placeholder="กรอกรหัสผ่าน" required autofocus>
+        <button type="submit">เข้าสู่ระบบ →</button>
     </form>
-
-    <div class="footer">
-        Protected Control System
-    </div>
-
+    <div class="small">Secure administrator dashboard</div>
 </div>
-
 </body>
 </html>
 """
 
 
 # ============================================================
-# DASHBOARD HTML
+# HTML - Dashboard
 # ============================================================
 
-HTML_TEMPLATE = r"""
-<!DOCTYPE html>
-
+DASHBOARD_HTML = r"""
+<!doctype html>
 <html lang="th">
-
 <head>
-
-<meta charset="UTF-8">
-
-<meta
-    name="viewport"
-    content="width=device-width, initial-scale=1"
->
-
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Roblox Control Center</title>
-
 <style>
-
-* {
-    box-sizing: border-box;
+:root{
+    --bg:#070a12;
+    --panel:#0f1420;
+    --panel2:#0b101a;
+    --border:#242c3e;
+    --text:#eef2ff;
+    --muted:#8994a8;
+    --blue:#6366f1;
+    --cyan:#06b6d4;
+    --green:#22c55e;
+    --yellow:#f59e0b;
+    --red:#ef4444;
 }
-
-:root {
-    --bg: #070a12;
-    --panel: #101522;
-    --panel2: #0c111d;
-
-    --border: rgba(255,255,255,.08);
-
-    --text: #f4f7ff;
-    --muted: #8792aa;
-
-    --blue: #5865f2;
-    --green: #22c55e;
-    --red: #ef4444;
-    --yellow: #f59e0b;
-    --cyan: #06b6d4;
-}
-
-body {
-
-    margin: 0;
-
-    min-height: 100vh;
-
-    font-family:
-        Inter,
-        "Segoe UI",
-        Tahoma,
-        sans-serif;
-
-    color: var(--text);
-
+*{box-sizing:border-box}
+body{
+    margin:0;
+    color:var(--text);
     background:
-        radial-gradient(
-            circle at 10% 0%,
-            rgba(88,101,242,.18),
-            transparent 35%
-        ),
-        radial-gradient(
-            circle at 100% 20%,
-            rgba(6,182,212,.08),
-            transparent 30%
-        ),
-        var(--bg);
-
-    padding: 24px;
+      radial-gradient(circle at 10% 0%,rgba(99,102,241,.13),transparent 28%),
+      radial-gradient(circle at 100% 100%,rgba(6,182,212,.08),transparent 30%),
+      var(--bg);
+    font-family:Inter,Segoe UI,Arial,sans-serif;
+}
+button,input,select{font:inherit}
+.app{width:min(1180px,100%);margin:auto;padding:22px}
+.header{
+    display:flex;justify-content:space-between;gap:15px;align-items:center;
+    padding:20px 22px;margin-bottom:18px;
+    border:1px solid var(--border);border-radius:20px;
+    background:rgba(15,20,32,.88);
+    box-shadow:0 20px 60px rgba(0,0,0,.22);
+}
+.brand{display:flex;align-items:center;gap:13px}
+.logo{
+    width:48px;height:48px;border-radius:15px;
+    display:grid;place-items:center;font-size:23px;
+    background:linear-gradient(135deg,var(--blue),var(--cyan));
+}
+h1{font-size:19px;margin:0}
+.sub{font-size:12px;color:var(--muted);margin-top:3px}
+.logout{
+    text-decoration:none;color:#ffc1c1;
+    border:1px solid #51222a;background:#211016;
+    padding:9px 13px;border-radius:10px;font-size:12px
+}
+.grid{display:grid;grid-template-columns:1.35fr .85fr;gap:18px}
+.panel{
+    background:rgba(15,20,32,.90);
+    border:1px solid var(--border);
+    border-radius:20px;padding:20px;
+}
+.panel h2{font-size:15px;margin:0 0 17px}
+.field{margin-bottom:15px}
+label{
+    display:block;margin-bottom:7px;
+    color:#aab4c7;font-size:12px;font-weight:700
+}
+input[type=text],input[type=number],input[type=password],select{
+    width:100%;height:44px;padding:0 12px;
+    color:#f8fafc;background:#090d16;
+    border:1px solid #273047;border-radius:10px;outline:none
+}
+input:focus,select:focus{
+    border-color:var(--blue);
+    box-shadow:0 0 0 3px rgba(99,102,241,.12)
+}
+.row{display:grid;grid-template-columns:1fr 170px;gap:12px}
+.check{
+    display:flex;align-items:center;gap:9px;
+    padding:11px 12px;border:1px solid var(--border);
+    border-radius:10px;background:#0b1019;margin-bottom:14px
+}
+.check input{width:17px;height:17px}
+.check label{margin:0;color:#dce3f1}
+.buttons{display:grid;grid-template-columns:repeat(3,1fr);gap:9px}
+.btn{
+    min-height:44px;padding:10px 12px;
+    border:0;border-radius:10px;color:#fff;
+    font-weight:750;cursor:pointer;transition:.15s;
+}
+.btn:hover{transform:translateY(-1px);filter:brightness(1.08)}
+.btn:disabled{opacity:.55;cursor:not-allowed;transform:none}
+.close{background:#b91c1c}
+.cancel{background:#b45309}
+.open{background:#15803d}
+.all{grid-column:1/-1}
+.blue{background:#4338ca}
+.gray{background:#1f2937}
+.status{
+    position:relative;overflow:hidden;
+    border:1px solid var(--border);
+    border-radius:16px;padding:17px;
+    background:#090e18;margin-bottom:12px
+}
+.status::before{
+    content:"";position:absolute;left:0;top:0;bottom:0;width:4px;
+    background:var(--green)
+}
+.status.scheduled::before{background:var(--yellow)}
+.status.closed::before{background:var(--red)}
+.status-head{display:flex;justify-content:space-between;gap:10px}
+.badge{
+    display:inline-flex;align-items:center;gap:6px;
+    padding:5px 8px;border-radius:999px;
+    font-size:11px;font-weight:800;background:#102719;color:#86efac
+}
+.badge.scheduled{background:#2b210c;color:#fcd34d}
+.badge.closed{background:#2a1115;color:#fca5a5}
+.big{font-size:27px;font-weight:850;margin:12px 0 3px}
+.timer{
+    font-variant-numeric:tabular-nums;
+    font-size:35px;font-weight:900;letter-spacing:1px
+}
+.progress{
+    height:7px;background:#1c2535;border-radius:99px;overflow:hidden;margin:12px 0
+}
+.progress > div{height:100%;width:0;background:linear-gradient(90deg,var(--blue),var(--cyan))}
+.details{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:13px}
+.detail{
+    padding:9px 10px;border-radius:9px;background:#0d1320;
+    border:1px solid #1d2638
+}
+.detail b{display:block;color:#68758b;font-size:10px;margin-bottom:3px}
+.detail span{font-size:12px;color:#dbe3f0;word-break:break-word}
+.reason{
+    margin-top:10px;padding:10px;border-radius:9px;
+    background:#0d1320;color:#bac5d7;font-size:12px
+}
+.token{
+    margin-top:18px;padding:15px;
+    border:1px solid var(--border);border-radius:15px;background:#090e18
+}
+.token-value{
+    margin-top:8px;padding:10px;
+    background:#060912;border-radius:9px;
+    color:#67e8f9;font-family:ui-monospace,Consolas,monospace;
+    font-size:12px;word-break:break-all
+}
+.token-actions{display:grid;grid-template-columns:1fr auto auto;gap:8px;margin-top:9px}
+.notice{
+    position:fixed;right:18px;bottom:18px;
+    max-width:390px;padding:13px 15px;
+    border:1px solid #2b3850;border-radius:12px;
+    background:#111827;color:#e5e7eb;
+    box-shadow:0 15px 50px rgba(0,0,0,.4);
+    display:none;z-index:100
+}
+.notice.show{display:block}
+.notice.ok{border-color:#185b35}
+.notice.bad{border-color:#6b2630}
+.db{
+    font-size:11px;padding:5px 8px;border-radius:999px;
+    background:#102719;color:#86efac
+}
+.db.off{background:#2a1115;color:#fca5a5}
+@media(max-width:850px){
+    .grid{grid-template-columns:1fr}
+}
+@media(max-width:600px){
+    .app{padding:12px}
+    .header{padding:15px}
+    .buttons{grid-template-columns:1fr}
+    .row{grid-template-columns:1fr}
+    .details{grid-template-columns:1fr}
+    .token-actions{grid-template-columns:1fr}
 }
-
-.container {
-
-    width: min(
-        100%,
-        1100px
-    );
-
-    margin: auto;
-}
-
-.header {
-
-    display: flex;
-
-    justify-content: space-between;
-    align-items: center;
-
-    gap: 20px;
-
-    margin-bottom: 22px;
-
-    padding: 22px;
-
-    border: 1px solid var(--border);
-
-    border-radius: 20px;
-
-    background:
-        linear-gradient(
-            135deg,
-            rgba(18,25,42,.96),
-            rgba(10,14,24,.96)
-        );
-
-    box-shadow:
-        0 20px 60px rgba(0,0,0,.25);
-}
-
-.brand {
-
-    display: flex;
-
-    align-items: center;
-
-    gap: 14px;
-}
-
-.logo {
-
-    width: 54px;
-    height: 54px;
-
-    display: grid;
-    place-items: center;
-
-    border-radius: 16px;
-
-    background:
-        linear-gradient(
-            135deg,
-            #5865f2,
-            #7c3aed
-        );
-
-    font-size: 25px;
-}
-
-.brand h1 {
-
-    margin: 0;
-
-    font-size: 21px;
-}
-
-.brand p {
-
-    margin: 4px 0 0;
-
-    color: var(--muted);
-
-    font-size: 13px;
-}
-
-.logout {
-
-    padding: 10px 14px;
-
-    border: 1px solid rgba(239,68,68,.25);
-
-    border-radius: 10px;
-
-    color: #ff8c98;
-
-    background: rgba(239,68,68,.08);
-
-    text-decoration: none;
-
-    font-weight: 600;
-}
-
-.grid {
-
-    display: grid;
-
-    grid-template-columns:
-        minmax(0, 1fr)
-        minmax(0, 1fr);
-
-    gap: 18px;
-}
-
-.card {
-
-    padding: 20px;
-
-    border: 1px solid var(--border);
-
-    border-radius: 18px;
-
-    background:
-        linear-gradient(
-            180deg,
-            rgba(17,23,38,.96),
-            rgba(11,15,26,.96)
-        );
-
-    box-shadow:
-        0 15px 45px rgba(0,0,0,.18);
-}
-
-.card.full {
-
-    grid-column: 1 / -1;
-}
-
-.card-title {
-
-    display: flex;
-
-    align-items: center;
-
-    justify-content: space-between;
-
-    gap: 10px;
-
-    margin-bottom: 16px;
-}
-
-.card-title h2 {
-
-    margin: 0;
-
-    font-size: 16px;
-}
-
-.card-title span {
-
-    color: var(--muted);
-
-    font-size: 12px;
-}
-
-label {
-
-    display: block;
-
-    margin-bottom: 7px;
-
-    color: #aeb8ce;
-
-    font-size: 13px;
-
-    font-weight: 600;
-}
-
-.form-group {
-
-    margin-bottom: 16px;
-}
-
-select,
-input {
-
-    width: 100%;
-
-    padding: 12px 13px;
-
-    border: 1px solid #293149;
-
-    border-radius: 11px;
-
-    outline: none;
-
-    background: #0b101c;
-
-    color: white;
-
-    font-size: 14px;
-}
-
-select:focus,
-input:focus {
-
-    border-color: #6675ff;
-
-    box-shadow:
-        0 0 0 3px
-        rgba(102,117,255,.10);
-}
-
-.reason-row {
-
-    display: flex;
-
-    gap: 9px;
-}
-
-.reason-row input {
-
-    flex: 1;
-}
-
-button {
-
-    border: 0;
-
-    border-radius: 11px;
-
-    padding: 12px 14px;
-
-    color: white;
-
-    font-weight: 700;
-
-    cursor: pointer;
-
-    transition:
-        transform .15s,
-        filter .15s,
-        opacity .15s;
-}
-
-button:hover {
-
-    filter: brightness(1.08);
-
-    transform: translateY(-1px);
-}
-
-button:disabled {
-
-    opacity: .45;
-
-    cursor: not-allowed;
-
-    transform: none;
-}
-
-.btn-save {
-
-    background: #2563eb;
-
-    white-space: nowrap;
-}
-
-.actions {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(3, 1fr);
-
-    gap: 10px;
-}
-
-.btn-close {
-
-    background:
-        linear-gradient(
-            135deg,
-            #dc2626,
-            #ef4444
-        );
-}
-
-.btn-cancel {
-
-    background:
-        linear-gradient(
-            135deg,
-            #d97706,
-            #f59e0b
-        );
-}
-
-.btn-open {
-
-    background:
-        linear-gradient(
-            135deg,
-            #16a34a,
-            #22c55e
-        );
-}
-
-.all-actions {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(3, 1fr);
-
-    gap: 10px;
-
-    margin-top: 10px;
-}
-
-.btn-all-close {
-
-    background:
-        linear-gradient(
-            135deg,
-            #991b1b,
-            #dc2626
-        );
-}
-
-.btn-all-cancel {
-
-    background:
-        linear-gradient(
-            135deg,
-            #b45309,
-            #d97706
-        );
-}
-
-.btn-all-open {
-
-    background:
-        linear-gradient(
-            135deg,
-            #0f766e,
-            #06b6d4
-        );
-}
-
-.timer-row {
-
-    display: flex;
-
-    align-items: center;
-
-    gap: 10px;
-
-    padding: 12px;
-
-    border: 1px solid var(--border);
-
-    border-radius: 12px;
-
-    background: rgba(255,255,255,.025);
-
-    margin-bottom: 15px;
-}
-
-.timer-row input {
-
-    width: auto;
-
-    min-width: 130px;
-}
-
-.checkbox {
-
-    width: 18px;
-    height: 18px;
-
-    accent-color: var(--blue);
-}
-
-.status {
-
-    position: relative;
-
-    overflow: hidden;
-
-    padding: 20px;
-
-    border-radius: 16px;
-
-    border: 1px solid var(--border);
-
-    background: #090e19;
-}
-
-.status-header {
-
-    display: flex;
-
-    justify-content: space-between;
-
-    align-items: center;
-
-    gap: 12px;
-
-    margin-bottom: 18px;
-}
-
-.status-name {
-
-    font-size: 18px;
-
-    font-weight: 800;
-}
-
-.badge {
-
-    display: inline-flex;
-
-    align-items: center;
-
-    gap: 7px;
-
-    padding: 7px 11px;
-
-    border-radius: 999px;
-
-    font-size: 12px;
-
-    font-weight: 800;
-}
-
-.badge.open {
-
-    color: #86efac;
-
-    background:
-        rgba(34,197,94,.10);
-
-    border: 1px solid
-        rgba(34,197,94,.18);
-}
-
-.badge.scheduled {
-
-    color: #fde68a;
-
-    background:
-        rgba(245,158,11,.10);
-
-    border: 1px solid
-        rgba(245,158,11,.18);
-}
-
-.badge.closed {
-
-    color: #fca5a5;
-
-    background:
-        rgba(239,68,68,.10);
-
-    border: 1px solid
-        rgba(239,68,68,.18);
-}
-
-.badge.loading {
-
-    color: #93c5fd;
-
-    background:
-        rgba(59,130,246,.10);
-}
-
-.status-grid {
-
-    display: grid;
-
-    grid-template-columns:
-        repeat(2, 1fr);
-
-    gap: 10px;
-}
-
-.info {
-
-    padding: 13px;
-
-    border-radius: 12px;
-
-    background:
-        rgba(255,255,255,.025);
-
-    border: 1px solid
-        rgba(255,255,255,.045);
-}
-
-.info .label {
-
-    color: #68748d;
-
-    font-size: 11px;
-
-    margin-bottom: 5px;
-}
-
-.info .value {
-
-    color: #e9edfa;
-
-    font-size: 13px;
-
-    font-weight: 650;
-
-    word-break: break-word;
-}
-
-.countdown {
-
-    margin: 18px 0 5px;
-
-    padding: 18px;
-
-    text-align: center;
-
-    border-radius: 15px;
-
-    background:
-        linear-gradient(
-            135deg,
-            rgba(88,101,242,.12),
-            rgba(6,182,212,.07)
-        );
-
-    border: 1px solid
-        rgba(88,101,242,.15);
-}
-
-.countdown-label {
-
-    color: #8792aa;
-
-    font-size: 12px;
-
-    margin-bottom: 5px;
-}
-
-.countdown-time {
-
-    font-family:
-        "Cascadia Code",
-        Consolas,
-        monospace;
-
-    font-size: 32px;
-
-    font-weight: 900;
-
-    letter-spacing: 1px;
-}
-
-.reason-display {
-
-    margin-top: 12px;
-
-    padding: 12px;
-
-    border-left: 3px solid var(--blue);
-
-    border-radius: 7px;
-
-    background:
-        rgba(88,101,242,.05);
-
-    color: #b9c2d7;
-
-    font-size: 13px;
-
-    line-height: 1.5;
-}
-
-.connection {
-
-    display: flex;
-
-    align-items: center;
-
-    gap: 8px;
-
-    margin-top: 14px;
-
-    color: #78849d;
-
-    font-size: 12px;
-}
-
-.dot {
-
-    width: 8px;
-    height: 8px;
-
-    border-radius: 50%;
-
-    background: #22c55e;
-
-    box-shadow:
-        0 0 12px rgba(34,197,94,.6);
-}
-
-.dot.error {
-
-    background: #ef4444;
-
-    box-shadow:
-        0 0 12px rgba(239,68,68,.6);
-}
-
-.token-section {
-
-    margin-top: 18px;
-}
-
-.token-controls {
-
-    display: flex;
-
-    gap: 9px;
-
-    margin-top: 10px;
-}
-
-.token-controls input {
-
-    flex: 1;
-}
-
-.token-button {
-
-    min-width: 100px;
-
-    background: #7c3aed;
-}
-
-.token-new {
-
-    background: #b45309;
-}
-
-.token-display {
-
-    padding: 13px;
-
-    border-radius: 11px;
-
-    background: #070b13;
-
-    border: 1px solid var(--border);
-
-    color: #67e8f9;
-
-    font-family:
-        "Cascadia Code",
-        Consolas,
-        monospace;
-
-    word-break: break-all;
-
-    font-size: 12px;
-}
-
-.toast {
-
-    position: fixed;
-
-    right: 20px;
-    bottom: 20px;
-
-    z-index: 9999;
-
-    max-width: 360px;
-
-    padding: 14px 16px;
-
-    border-radius: 13px;
-
-    color: white;
-
-    background: #111827;
-
-    border: 1px solid var(--border);
-
-    box-shadow:
-        0 20px 50px rgba(0,0,0,.4);
-
-    transform:
-        translateY(20px);
-
-    opacity: 0;
-
-    pointer-events: none;
-
-    transition: .25s;
-}
-
-.toast.show {
-
-    transform:
-        translateY(0);
-
-    opacity: 1;
-}
-
-.toast.success {
-
-    border-color:
-        rgba(34,197,94,.25);
-}
-
-.toast.error {
-
-    border-color:
-        rgba(239,68,68,.25);
-}
-
-@media (max-width: 800px) {
-
-    body {
-        padding: 12px;
-    }
-
-    .grid {
-        grid-template-columns: 1fr;
-    }
-
-    .card.full {
-        grid-column: auto;
-    }
-
-    .actions,
-    .all-actions {
-        grid-template-columns: 1fr;
-    }
-
-    .header {
-        align-items: flex-start;
-    }
-
-    .reason-row {
-        flex-direction: column;
-    }
-
-    .token-controls {
-        flex-direction: column;
-    }
-
-    .status-grid {
-        grid-template-columns: 1fr;
-    }
-}
-
 </style>
-
 </head>
 
 <body>
+<div class="app">
 
-<div class="container">
-
-    <!-- HEADER -->
-
-    <header class="header">
-
-        <div class="brand">
-
-            <div class="logo">
-                🛡️
-            </div>
-
-            <div>
-
-                <h1>
-                    Roblox Control Center
-                </h1>
-
-                <p>
-                    Server Management Dashboard
-                </p>
-
-            </div>
-
+<header class="header">
+    <div class="brand">
+        <div class="logo">🛡️</div>
+        <div>
+            <h1>Roblox Control Center</h1>
+            <div class="sub">ระบบควบคุมสถานะเซิร์ฟเวอร์แบบ Real-time</div>
         </div>
-
-        <a
-            class="logout"
-            href="/logout"
-        >
-            ออกจากระบบ
-        </a>
-
-    </header>
-
-
-    <div class="grid">
-
-
-        <!-- CONFIG -->
-
-        <section class="card">
-
-            <div class="card-title">
-
-                <h2>
-                    ⚙️ ตั้งค่าการควบคุม
-                </h2>
-
-                <span>
-                    Control
-                </span>
-
-            </div>
-
-
-            <div class="form-group">
-
-                <label>
-                    แมพที่ต้องการจัดการ
-                </label>
-
-                <select
-                    id="mapSelect"
-                    onchange="loadMapState()"
-                >
-
-                    <option value="ALL">
-                        🌐 ทุกแมพ
-                    </option>
-
-                    {% for name, pid in maps.items() %}
-
-                    <option value="{{ pid }}">
-                        {{ name }} — {{ pid }}
-                    </option>
-
-                    {% endfor %}
-
-                </select>
-
-            </div>
-
-
-            <div class="form-group">
-
-                <label>
-                    เหตุผล / ข้อความแจ้งเตือน
-                </label>
-
-                <div class="reason-row">
-
-                    <input
-                        id="reasonInput"
-                        type="text"
-                        maxlength="500"
-                        value="{{ default_reason }}"
-                    >
-
-                    <button
-                        class="btn-save"
-                        onclick="saveConfigOnly()"
-                    >
-                        💾 บันทึก
-                    </button>
-
-                </div>
-
-            </div>
-
-
-            <div class="timer-row">
-
-                <input
-                    class="checkbox"
-                    id="timerEnabled"
-                    type="checkbox"
-                    checked
-                    onchange="toggleTimerInput()"
-                >
-
-                <div style="flex:1">
-
-                    <label
-                        for="timerEnabled"
-                        style="margin:0"
-                    >
-                        เปิดระบบนับถอยหลังก่อนปิด
-                    </label>
-
-                </div>
-
-                <input
-                    id="secondsInput"
-                    type="number"
-                    min="{{ min_seconds }}"
-                    max="{{ max_seconds }}"
-                    value="{{ default_seconds }}"
-                >
-
-                <span style="color:#78849d;font-size:12px">
-                    วินาที
-                </span>
-
-            </div>
-
-
-            <div class="actions">
-
-                <button
-                    class="btn-close"
-                    onclick="sendAction('scheduled')"
-                >
-                    🛑 เริ่มปิด
-                </button>
-
-                <button
-                    class="btn-cancel"
-                    onclick="sendAction('open-cancel')"
-                >
-                    ↩ ยกเลิก
-                </button>
-
-                <button
-                    class="btn-open"
-                    onclick="sendAction('open')"
-                >
-                    ✅ เปิดแมพ
-                </button>
-
-            </div>
-
-        </section>
-
-
-        <!-- STATUS -->
-
-        <section class="card">
-
-            <div class="card-title">
-
-                <h2>
-                    📊 สถานะระบบ
-                </h2>
-
-                <span id="lastUpdate">
-                    กำลังโหลด...
-                </span>
-
-            </div>
-
-            <div
-                class="status"
-                id="statusView"
-            >
-
-                กำลังโหลดสถานะ...
-
-            </div>
-
-        </section>
-
-
-        <!-- ALL MAPS -->
-
-        <section class="card full">
-
-            <div class="card-title">
-
-                <h2>
-                    🌐 ควบคุมทุกแมพ
-                </h2>
-
-                <span>
-                    Global Control
-                </span>
-
-            </div>
-
-            <div class="all-actions">
-
-                <button
-                    class="btn-all-close"
-                    onclick="sendActionAll('scheduled')"
-                >
-                    🚨 ปิดทุกแมพ
-                </button>
-
-                <button
-                    class="btn-all-cancel"
-                    onclick="sendActionAll('open-cancel')"
-                >
-                    ↩ ยกเลิกการปิดทั้งหมด
-                </button>
-
-                <button
-                    class="btn-all-open"
-                    onclick="sendActionAll('open')"
-                >
-                    🟢 เปิดทุกแมพ
-                </button>
-
-            </div>
-
-        </section>
-
-
-        <!-- TOKEN -->
-
-        <section class="card full">
-
-            <div class="card-title">
-
-                <h2>
-                    🔑 API Token
-                </h2>
-
-                <span>
-                    Roblox API Authentication
-                </span>
-
-            </div>
-
-            <div class="token-display" id="tokenDisplay">
-                ••••••••••••••••••••••••••••••••
-            </div>
-
-            <div class="token-controls">
-
-                <input
-                    id="pinInput"
-                    type="password"
-                    placeholder="PIN สำหรับจัดการ Token"
-                    autocomplete="off"
-                >
-
-                <button
-                    class="token-button"
-                    onclick="toggleToken()"
-                >
-                    👁️ แสดง / ซ่อน
-                </button>
-
-                <button
-                    class="token-new"
-                    onclick="generateNewToken()"
-                >
-                    🔄 สร้าง Token ใหม่
-                </button>
-
-            </div>
-
-            <div class="connection">
-
-                <span
-                    class="dot"
-                    id="connectionDot"
-                ></span>
-
-                <span id="connectionText">
-                    ระบบพร้อมใช้งาน
-                </span>
-
-            </div>
-
-        </section>
-
+    </div>
+    <div style="display:flex;align-items:center;gap:9px">
+        <span id="dbBadge" class="db">● DATABASE OK</span>
+        <a class="logout" href="/logout">ออกจากระบบ</a>
+    </div>
+</header>
+
+<div class="grid">
+
+<section class="panel">
+    <h2>⚙️ การควบคุม</h2>
+
+    <div class="field">
+        <label>เลือกแมพ</label>
+        <select id="mapSelect" onchange="loadSelected()">
+            <option value="ALL">🌐 จัดการทุกแมพ</option>
+            {% for name, pid in maps.items() %}
+            <option value="{{ pid }}">{{ name }} · {{ pid }}</option>
+            {% endfor %}
+        </select>
     </div>
 
+    <div class="field">
+        <label>เหตุผล / ข้อความแจ้งเตือน</label>
+        <input id="reasonInput" type="text"
+               value="{{ default_reason }}"
+               maxlength="500">
+    </div>
+
+    <div class="row">
+        <div class="field">
+            <label>เวลา Countdown (วินาที)</label>
+            <input id="secondsInput" type="number"
+                   min="1" max="86400" value="60">
+        </div>
+        <div class="field">
+            <label>สถานะ Timer</label>
+            <div class="check">
+                <input id="timerEnabled" type="checkbox" checked>
+                <label for="timerEnabled">นับถอยหลังก่อนปิด</label>
+            </div>
+        </div>
+    </div>
+
+    <div class="buttons">
+        <button class="btn close" onclick="actionSelected('scheduled')">
+            🛑 เริ่มปิด
+        </button>
+        <button class="btn cancel" onclick="actionSelected('open')">
+            ↩ ยกเลิก / เปิด
+        </button>
+        <button class="btn open" onclick="actionSelected('open')">
+            🟢 เปิดแมพ
+        </button>
+
+        <button class="btn close all" onclick="actionAll('closed')">
+            🚨 ปิดทุกแมพทันที
+        </button>
+        <button class="btn cancel all" onclick="actionAll('open')">
+            ↩️ เปิด / ยกเลิกการปิดทุกแมพ
+        </button>
+        <button class="btn blue all" onclick="actionAll('scheduled')">
+            ⏳ Countdown ทุกแมพ
+        </button>
+    </div>
+
+    <div style="margin-top:10px">
+        <button class="btn gray" style="width:100%" onclick="saveConfig()">
+            💾 บันทึกข้อความ + เวลา โดยไม่เปลี่ยนสถานะ
+        </button>
+    </div>
+</section>
+
+
+<section class="panel">
+    <h2>📡 สถานะระบบ</h2>
+    <div id="statusList">
+        <div class="status">กำลังโหลด...</div>
+    </div>
+
+    <div class="token">
+        <div style="font-weight:800;font-size:13px">🔑 Roblox API Token</div>
+        <div class="sub" style="margin-top:4px">
+            Token จะไม่ถูกส่งลงหน้าเว็บจนกว่าจะยืนยัน PIN
+        </div>
+
+        <div id="tokenDisplay" class="token-value">
+            ••••••••••••••••••••••••••••••••
+        </div>
+
+        <div class="token-actions">
+            <input id="pinInput" type="password" placeholder="Token PIN"
+                   autocomplete="off">
+            <button class="btn blue" onclick="revealToken()">👁️ ดู Token</button>
+            <button class="btn close" onclick="newToken()">🔄 สร้างใหม่</button>
+        </div>
+    </div>
+</section>
+
+</div>
 </div>
 
-
-<div
-    class="toast"
-    id="toast"
-></div>
-
+<div id="notice" class="notice"></div>
 
 <script>
-
-let currentState = null;
-let serverOffset = 0;
+let selectedState = null;
 let tokenVisible = false;
+let actualToken = "";
+let serverOffsetMs = 0;
+let busy = false;
 
+const $ = id => document.getElementById(id);
 
-// ============================================================
-// TOAST
-// ============================================================
-
-function showToast(
-    message,
-    type = "success"
-) {
-
-    const toast =
-        document.getElementById("toast");
-
-    toast.innerText = message;
-
-    toast.className =
-        "toast show " + type;
-
-    setTimeout(() => {
-
-        toast.className =
-            "toast";
-
-    }, 3500);
+function escapeHtml(value) {
+    return String(value ?? "").replace(/[&<>"']/g, ch => ({
+        "&":"&amp;",
+        "<":"&lt;",
+        ">":"&gt;",
+        '"':"&quot;",
+        "'":"&#039;"
+    }[ch]));
 }
 
+function notify(message, ok=true) {
+    const box = $("notice");
+    box.textContent = message;
+    box.className = "notice show " + (ok ? "ok" : "bad");
+    clearTimeout(notify.timer);
+    notify.timer = setTimeout(() => {
+        box.className = "notice";
+    }, 4200);
+}
 
-// ============================================================
-// API HELPER
-// ============================================================
+function setBusy(value) {
+    busy = value;
+    document.querySelectorAll("button").forEach(btn => {
+        btn.disabled = value;
+    });
+}
 
-async function api(
-    url,
-    options = {}
-) {
+function fmtDuration(totalSeconds) {
+    totalSeconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+    const d = Math.floor(totalSeconds / 86400);
+    totalSeconds %= 86400;
+    const h = Math.floor(totalSeconds / 3600);
+    totalSeconds %= 3600;
+    const m = Math.floor(totalSeconds / 60);
+    const s = totalSeconds % 60;
 
-    const response =
-        await fetch(
-            url,
-            {
-                ...options,
+    if (d > 0) {
+        return `${d}d ${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+    }
+    return `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+}
 
-                headers: {
-                    "Content-Type":
-                        "application/json",
+function fmtClock(ts) {
+    if (!ts) return "-";
+    return new Date(Number(ts) * 1000).toLocaleTimeString("th-TH", {
+        hour:"2-digit",
+        minute:"2-digit",
+        second:"2-digit"
+    });
+}
 
-                    ...(options.headers || {})
-                },
+function currentServerTime() {
+    return (Date.now() + serverOffsetMs) / 1000;
+}
 
-                cache: "no-store"
-            }
-        );
+function modeInfo(mode) {
+    if (mode === "scheduled") {
+        return ["🟠 กำลังนับถอยหลัง", "scheduled"];
+    }
+    if (mode === "closed") {
+        return ["🔴 ปิดเซิร์ฟเวอร์", "closed"];
+    }
+    return ["🟢 เปิดให้บริการ", "open"];
+}
+
+function renderStatus(states) {
+    const list = $("statusList");
+    if (!states || !states.length) {
+        list.innerHTML = `<div class="status">ไม่พบข้อมูลสถานะ</div>`;
+        return;
+    }
+
+    list.innerHTML = states.map(item => {
+        const [label, cls] = modeInfo(item.mode);
+        const now = currentServerTime();
+
+        let timer = "เปิดอยู่";
+        let progress = 0;
+        let extra = "";
+
+        if (item.mode === "scheduled" && item.deadline) {
+            const remaining = Math.max(0, Number(item.deadline) - now);
+            const total = Math.max(1, Number(item.seconds || 60));
+            const elapsed = Math.min(total, Math.max(0, total - remaining));
+            progress = Math.min(100, (elapsed / total) * 100);
+            timer = fmtDuration(remaining);
+            extra = `
+                <div class="detail">
+                    <b>ผ่านไปแล้ว</b>
+                    <span>${fmtDuration(elapsed)}</span>
+                </div>
+                <div class="detail">
+                    <b>เหลืออีก</b>
+                    <span>${fmtDuration(remaining)}</span>
+                </div>
+                <div class="detail">
+                    <b>เริ่มนับ</b>
+                    <span>${fmtClock(Number(item.deadline) - total)}</span>
+                </div>
+                <div class="detail">
+                    <b>กำหนดปิด</b>
+                    <span>${fmtClock(item.deadline)}</span>
+                </div>`;
+        } else if (item.mode === "closed" && item.deadline) {
+            const elapsed = Math.max(0, now - Number(item.deadline));
+            timer = fmtDuration(elapsed);
+            extra = `
+                <div class="detail">
+                    <b>ปิดเมื่อ</b>
+                    <span>${fmtClock(item.deadline)}</span>
+                </div>
+                <div class="detail">
+                    <b>ปิดมาแล้ว</b>
+                    <span>${fmtDuration(elapsed)}</span>
+                </div>`;
+        } else {
+            extra = `
+                <div class="detail">
+                    <b>Server Time</b>
+                    <span>${fmtClock(now)}</span>
+                </div>
+                <div class="detail">
+                    <b>Countdown</b>
+                    <span>ไม่ได้ทำงาน</span>
+                </div>`;
+        }
+
+        const reason = escapeHtml(item.reason || "-");
+        const name = escapeHtml(item.name || item.place_id);
+
+        return `
+        <div class="status ${cls}" data-place="${escapeHtml(item.place_id)}">
+            <div class="status-head">
+                <div>
+                    <div style="font-size:12px;color:#7f8ba0">${name}</div>
+                    <div class="big">${timer}</div>
+                </div>
+                <span class="badge ${cls}">${label}</span>
+            </div>
+
+            ${item.mode === "scheduled"
+                ? `<div class="progress"><div style="width:${progress}%"></div></div>`
+                : ""}
+
+            <div class="details">
+                <div class="detail">
+                    <b>Place ID</b>
+                    <span>${escapeHtml(item.place_id)}</span>
+                </div>
+                <div class="detail">
+                    <b>สถานะ Database</b>
+                    <span>${item.dbAvailable ? "🟢 เชื่อมต่อแล้ว" : "🔴 Offline"}</span>
+                </div>
+                ${extra}
+            </div>
+
+            <div class="reason">
+                <b style="color:#7f8ba0">เหตุผล:</b>
+                ${reason}
+            </div>
+        </div>`;
+    }).join("");
+
+    const dbOk = states.every(s => s.dbAvailable !== false);
+    $("dbBadge").textContent = dbOk ? "● DATABASE OK" : "● DATABASE OFFLINE";
+    $("dbBadge").className = dbOk ? "db" : "db off";
+}
+
+function applyFormState(item) {
+    if (!item) return;
+    $("reasonInput").value = item.reason || "";
+    $("secondsInput").value = item.seconds || 60;
+    $("timerEnabled").checked = item.mode === "scheduled" || item.mode === "open";
+}
+
+async function api(url, options={}) {
+    const response = await fetch(url, {
+        cache:"no-store",
+        ...options,
+        headers:{
+            "Content-Type":"application/json",
+            ...(options.headers || {})
+        }
+    });
 
     let data = null;
-
     try {
         data = await response.json();
-    }
-    catch {
-        data = {};
-    }
+    } catch (_) {}
 
     if (!response.ok) {
-
-        const message =
-            data.error ||
-            `HTTP ${response.status}`;
-
+        const message = data?.error || `HTTP ${response.status}`;
         throw new Error(message);
     }
-
     return data;
 }
 
+async function loadSelected() {
+    if (busy) return;
 
-// ============================================================
-// TIMER INPUT
-// ============================================================
+    const pid = $("mapSelect").value;
 
-function toggleTimerInput() {
+    try {
+        if (pid === "ALL") {
+            const data = await api("/api/states");
+            if (data.serverNow) {
+                serverOffsetMs = Number(data.serverNow) * 1000 - Date.now();
+            }
+            renderStatus(data.states);
 
-    const enabled =
-        document.getElementById(
-            "timerEnabled"
-        ).checked;
-
-    const input =
-        document.getElementById(
-            "secondsInput"
-        );
-
-    input.disabled = !enabled;
-}
-
-
-// ============================================================
-// FORMAT TIME
-// ============================================================
-
-function formatDuration(seconds) {
-
-    seconds = Math.max(
-        0,
-        Math.floor(seconds)
-    );
-
-    const days =
-        Math.floor(
-            seconds / 86400
-        );
-
-    seconds %= 86400;
-
-    const hours =
-        Math.floor(
-            seconds / 3600
-        );
-
-    seconds %= 3600;
-
-    const minutes =
-        Math.floor(
-            seconds / 60
-        );
-
-    seconds %= 60;
-
-    if (days > 0) {
-
-        return `${days}วัน ` +
-               `${String(hours).padStart(2,"0")}:` +
-               `${String(minutes).padStart(2,"0")}:` +
-               `${String(seconds).padStart(2,"0")}`;
-
-    }
-
-    return (
-        `${String(hours).padStart(2,"0")}:` +
-        `${String(minutes).padStart(2,"0")}:` +
-        `${String(seconds).padStart(2,"0")}`
-    );
-}
-
-
-function formatDate(timestamp) {
-
-    if (!timestamp) {
-        return "-";
-    }
-
-    const date =
-        new Date(
-            timestamp * 1000
-        );
-
-    return date.toLocaleString(
-        "th-TH",
-        {
-            dateStyle: "medium",
-            timeStyle: "medium"
+            if (data.states?.length) {
+                applyFormState(data.states[0]);
+            }
+            return;
         }
-    );
+
+        const data = await api("/api/state/" + encodeURIComponent(pid));
+        selectedState = data;
+
+        if (data.serverNow) {
+            serverOffsetMs = Number(data.serverNow) * 1000 - Date.now();
+        }
+
+        applyFormState(data);
+        renderStatus([{
+            ...data,
+            place_id: pid,
+            name: data.name || Object.keys({{ maps|tojson }}).find(
+                k => {{ maps|tojson }}[k] === pid
+            ) || pid
+        }]);
+    } catch (err) {
+        notify("โหลดสถานะไม่สำเร็จ: " + err.message, false);
+    }
 }
 
+async function refreshStatusOnly() {
+    if (busy) return;
 
-// ============================================================
-// STATUS
-// ============================================================
+    const pid = $("mapSelect").value;
 
-function statusBadge(mode) {
+    try {
+        if (pid === "ALL") {
+            const data = await api("/api/states");
+            if (data.serverNow) {
+                serverOffsetMs = Number(data.serverNow) * 1000 - Date.now();
+            }
+            renderStatus(data.states);
+        } else {
+            const data = await api("/api/state/" + encodeURIComponent(pid));
+            selectedState = data;
 
-    if (mode === "open") {
+            if (data.serverNow) {
+                serverOffsetMs = Number(data.serverNow) * 1000 - Date.now();
+            }
 
-        return `
-            <span class="badge open">
-                🟢 เปิดให้บริการ
-            </span>
-        `;
+            const names = {{ maps|tojson }};
+            let name = pid;
+            for (const [key, value] of Object.entries(names)) {
+                if (value === pid) name = key;
+            }
+
+            renderStatus([{
+                ...data,
+                place_id: pid,
+                name
+            }]);
+        }
+    } catch (err) {
+        console.error(err);
     }
-
-    if (mode === "scheduled") {
-
-        return `
-            <span class="badge scheduled">
-                🟡 กำลังนับถอยหลัง
-            </span>
-        `;
-    }
-
-    return `
-        <span class="badge closed">
-            🔴 ปิดปรับปรุง
-        </span>
-    `;
 }
 
+function getFormValues() {
+    const reason = $("reasonInput").value.trim();
+    let seconds = Number.parseInt($("secondsInput").value, 10);
 
-function renderStatus(data) {
+    if (!Number.isFinite(seconds)) seconds = 60;
+    seconds = Math.max(1, Math.min(86400, seconds));
 
-    currentState = data;
-
-    serverOffset =
-        (data.serverNow * 1000)
-        - Date.now();
-
-    const status =
-        document.getElementById(
-            "statusView"
-        );
-
-    let countdown = "";
-
-    if (
-        data.mode === "scheduled" &&
-        data.remainingSeconds !== null
-    ) {
-
-        countdown = `
-            <div class="countdown">
-
-                <div class="countdown-label">
-                    เวลาที่เหลือก่อนปิด
-                </div>
-
-                <div
-                    class="countdown-time"
-                    id="countdownTime"
-                >
-                    ${formatDuration(
-                        data.remainingSeconds
-                    )}
-                </div>
-
-            </div>
-        `;
-
-    }
-    else if (
-        data.mode === "closed"
-    ) {
-
-        countdown = `
-            <div class="countdown">
-
-                <div class="countdown-label">
-                    สถานะปัจจุบัน
-                </div>
-
-                <div class="countdown-time">
-                    ปิดอยู่
-                </div>
-
-            </div>
-        `;
-
-    }
-    else {
-
-        countdown = `
-            <div class="countdown">
-
-                <div class="countdown-label">
-                    สถานะปัจจุบัน
-                </div>
-
-                <div class="countdown-time">
-                    พร้อมให้บริการ
-                </div>
-
-            </div>
-        `;
-    }
-
-
-    status.innerHTML = `
-
-        <div class="status-header">
-
-            <div class="status-name">
-                Roblox Server
-            </div>
-
-            ${statusBadge(data.mode)}
-
-        </div>
-
-
-        <div class="status-grid">
-
-            <div class="info">
-
-                <div class="label">
-                    MODE
-                </div>
-
-                <div class="value">
-                    ${data.mode}
-                </div>
-
-            </div>
-
-
-            <div class="info">
-
-                <div class="label">
-                    ระยะเวลาที่ตั้งไว้
-                </div>
-
-                <div class="value">
-                    ${data.seconds} วินาที
-                </div>
-
-            </div>
-
-
-            <div class="info">
-
-                <div class="label">
-                    เริ่มนับถอยหลัง
-                </div>
-
-                <div class="value">
-                    ${
-                        data.startedAt
-                        ? formatDate(
-                            data.startedAt
-                        )
-                        : "-"
-                    }
-                </div>
-
-            </div>
-
-
-            <div class="info">
-
-                <div class="label">
-                    เวลาสิ้นสุด
-                </div>
-
-                <div class="value">
-                    ${
-                        data.deadline
-                        ? formatDate(
-                            data.deadline
-                        )
-                        : "-"
-                    }
-                </div>
-
-            </div>
-
-        </div>
-
-
-        ${countdown}
-
-
-        <div class="info">
-
-            <div class="label">
-                เวลาเซิร์ฟเวอร์
-            </div>
-
-            <div class="value">
-                ${formatDate(
-                    data.serverNow
-                )}
-            </div>
-
-        </div>
-
-
-        <div class="reason-display">
-
-            <strong>
-                📝 เหตุผล:
-            </strong>
-
-            ${escapeHtml(
-                data.reason
-            )}
-
-        </div>
-
-
-        <div class="connection">
-
-            <span class="dot"></span>
-
-            <span>
-                ได้รับข้อมูลจาก Server สำเร็จ
-            </span>
-
-        </div>
-
-    `;
-
-    document.getElementById(
-        "lastUpdate"
-    ).innerText =
-        "อัปเดต " +
-        new Date().toLocaleTimeString(
-            "th-TH"
-        );
+    return {reason, seconds};
 }
 
+async function saveConfig() {
+    if (busy) return;
 
-// ============================================================
-// HTML ESCAPE
-// ============================================================
+    const pid = $("mapSelect").value;
+    const {reason, seconds} = getFormValues();
 
-function escapeHtml(text) {
+    setBusy(true);
 
-    const div =
-        document.createElement(
-            "div"
-        );
+    try {
+        const data = await api("/api/save-config", {
+            method:"POST",
+            body:JSON.stringify({
+                place_id:pid,
+                reason,
+                seconds
+            })
+        });
 
-    div.textContent =
-        text ?? "";
-
-    return div.innerHTML;
+        notify(data.message || "บันทึกข้อมูลสำเร็จ");
+        await loadSelected();
+    } catch (err) {
+        notify("บันทึกไม่สำเร็จ: " + err.message, false);
+    } finally {
+        setBusy(false);
+    }
 }
 
+async function actionSelected(action) {
+    if (busy) return;
 
-// ============================================================
-// LOAD STATE
-// ============================================================
-
-async function loadMapState() {
-
-    const pid =
-        document.getElementById(
-            "mapSelect"
-        ).value;
-
+    const pid = $("mapSelect").value;
 
     if (pid === "ALL") {
-
-        document.getElementById(
-            "statusView"
-        ).innerHTML = `
-
-            <div class="status-header">
-
-                <div class="status-name">
-                    🌐 ทุกแมพ
-                </div>
-
-                <span class="badge loading">
-                    กำลังดูภาพรวม
-                </span>
-
-            </div>
-
-            <div class="reason-display">
-                เลือกแมพเฉพาะตัว
-                เพื่อดูตัวจับเวลาและรายละเอียด
-                ของแมพนั้นแบบละเอียด
-            </div>
-
-        `;
-
+        notify("ตอนเลือกทุกแมพ ให้ใช้ปุ่มควบคุมทุกแมพด้านล่าง", false);
         return;
     }
 
+    const {reason, seconds} = getFormValues();
+
+    let mode = action;
+    if (action === "scheduled" && !$("timerEnabled").checked) {
+        mode = "closed";
+    }
+
+    if (mode === "closed" &&
+        !confirm("ยืนยันการปิดแมพนี้ทันทีหรือไม่?")) {
+        return;
+    }
+
+    setBusy(true);
 
     try {
+        const data = await api("/api/update", {
+            method:"POST",
+            body:JSON.stringify({
+                place_id:pid,
+                mode,
+                reason,
+                seconds
+            })
+        });
 
-        const data =
-            await api(
-                "/api/state/" + pid
-            );
-
-        document.getElementById(
-            "reasonInput"
-        ).value =
-            data.reason || "";
-
-
-        if (data.seconds) {
-
-            document.getElementById(
-                "secondsInput"
-            ).value =
-                data.seconds;
-        }
-
-
-        renderStatus(data);
-
-        setConnection(
-            true,
-            "เชื่อมต่อ Server สำเร็จ"
-        );
-
-    }
-    catch (error) {
-
-        console.error(error);
-
-        setConnection(
-            false,
-            "ไม่สามารถโหลดสถานะได้"
-        );
-
-        showToast(
-            "ไม่สามารถโหลดสถานะ: " +
-            error.message,
-            "error"
-        );
+        notify(data.message || "คำสั่งถูกบันทึกแล้ว");
+        await loadSelected();
+    } catch (err) {
+        notify("ทำรายการไม่สำเร็จ: " + err.message, false);
+    } finally {
+        setBusy(false);
     }
 }
 
+async function actionAll(action) {
+    if (busy) return;
 
-// ============================================================
-// CONNECTION
-// ============================================================
+    const {reason, seconds} = getFormValues();
 
-function setConnection(
-    connected,
-    text
-) {
+    let mode = action;
 
-    const dot =
-        document.getElementById(
-            "connectionDot"
-        );
-
-    dot.classList.toggle(
-        "error",
-        !connected
-    );
-
-    document.getElementById(
-        "connectionText"
-    ).innerText =
-        text;
-}
-
-
-// ============================================================
-// SAVE CONFIG
-// ============================================================
-
-async function saveConfigOnly() {
-
-    const pid =
-        document.getElementById(
-            "mapSelect"
-        ).value;
-
-    const reason =
-        document.getElementById(
-            "reasonInput"
-        ).value.trim();
-
-    const seconds =
-        Number(
-            document.getElementById(
-                "secondsInput"
-            ).value
-        );
-
-
-    if (
-        !Number.isInteger(seconds) ||
-        seconds < {{ min_seconds }} ||
-        seconds > {{ max_seconds }}
-    ) {
-
-        showToast(
-            "กรุณากรอกเวลาให้ถูกต้อง",
-            "error"
-        );
-
-        return;
+    if (mode === "scheduled" && !$("timerEnabled").checked) {
+        mode = "closed";
     }
 
+    const message = mode === "closed"
+        ? "ยืนยันปิดทุกแมพทันทีหรือไม่?"
+        : mode === "scheduled"
+            ? "ยืนยันเริ่ม Countdown ทุกแมพหรือไม่?"
+            : "ยืนยันเปิดทุกแมพหรือไม่?";
+
+    if (!confirm(message)) return;
+
+    setBusy(true);
 
     try {
+        const data = await api("/api/update-all", {
+            method:"POST",
+            body:JSON.stringify({
+                mode,
+                reason,
+                seconds
+            })
+        });
 
-        await api(
-            "/api/save-config",
-            {
-                method: "POST",
-
-                body: JSON.stringify({
-                    place_id: pid,
-                    reason: reason,
-                    seconds: seconds
-                })
-            }
-        );
-
-
-        showToast(
-            "💾 บันทึกข้อมูลสำเร็จ",
-            "success"
-        );
-
-        await loadMapState();
-
-    }
-    catch (error) {
-
-        showToast(
-            "❌ บันทึกไม่สำเร็จ: " +
-            error.message,
-            "error"
-        );
+        notify(data.message || "บันทึกทุกแมพสำเร็จ");
+        await loadSelected();
+    } catch (err) {
+        notify("ทำรายการไม่สำเร็จ: " + err.message, false);
+    } finally {
+        setBusy(false);
     }
 }
 
-
-// ============================================================
-// SINGLE ACTION
-// ============================================================
-
-async function sendAction(
-    actionType
-) {
-
-    const pid =
-        document.getElementById(
-            "mapSelect"
-        ).value;
-
-
-    if (pid === "ALL") {
-
-        showToast(
-            "กรุณาเลือกแมพ หรือใช้ปุ่มควบคุมทั้งหมด",
-            "error"
-        );
-
-        return;
-    }
-
-
-    const reason =
-        document.getElementById(
-            "reasonInput"
-        ).value.trim();
-
-    const seconds =
-        Number(
-            document.getElementById(
-                "secondsInput"
-            ).value
-        );
-
-
-    if (
-        !Number.isInteger(seconds) ||
-        seconds < {{ min_seconds }} ||
-        seconds > {{ max_seconds }}
-    ) {
-
-        showToast(
-            "เวลาไม่ถูกต้อง",
-            "error"
-        );
-
-        return;
-    }
-
-
-    let mode = "open";
-
-
-    if (
-        actionType === "scheduled"
-    ) {
-
-        mode =
-            document.getElementById(
-                "timerEnabled"
-            ).checked
-            ? "scheduled"
-            : "closed";
-    }
-
-
-    if (
-        actionType === "open" ||
-        actionType === "open-cancel"
-    ) {
-
-        mode = "open";
-    }
-
-
-    if (
-        actionType === "scheduled" &&
-        !confirm(
-            `ยืนยันเริ่มระบบปิดใน ${seconds} วินาที?`
-        )
-    ) {
-        return;
-    }
-
+async function revealToken() {
+    const pin = $("pinInput").value;
 
     try {
+        const data = await api("/api/token", {
+            method:"POST",
+            body:JSON.stringify({pin})
+        });
 
-        await api(
-            "/api/update",
-            {
-                method: "POST",
+        actualToken = data.token || "";
+        tokenVisible = !tokenVisible;
 
-                body: JSON.stringify({
-                    place_id: pid,
-                    mode: mode,
-                    reason: reason,
-                    seconds: seconds
-                })
-            }
-        );
+        $("tokenDisplay").textContent = tokenVisible
+            ? actualToken
+            : "••••••••••••••••••••••••••••••••";
 
-
-        showToast(
-            "✅ บันทึกคำสั่งสำเร็จ",
-            "success"
-        );
-
-
-        await loadMapState();
-
-    }
-    catch (error) {
-
-        showToast(
-            "❌ ไม่สามารถบันทึกคำสั่ง: " +
-            error.message,
-            "error"
-        );
+        notify(tokenVisible
+            ? "แสดง Token แล้ว"
+            : "ซ่อน Token แล้ว");
+    } catch (err) {
+        notify("PIN ไม่ถูกต้องหรือไม่สามารถอ่าน Token ได้", false);
     }
 }
 
-
-// ============================================================
-// ALL MAPS
-// ============================================================
-
-async function sendActionAll(
-    actionType
-) {
-
-    const reason =
-        document.getElementById(
-            "reasonInput"
-        ).value.trim();
-
-    const seconds =
-        Number(
-            document.getElementById(
-                "secondsInput"
-            ).value
-        );
-
-
-    let mode = "open";
-
-
-    if (
-        actionType === "scheduled"
-    ) {
-
-        mode =
-            document.getElementById(
-                "timerEnabled"
-            ).checked
-            ? "scheduled"
-            : "closed";
-    }
-
-
-    const message =
-        mode === "scheduled"
-        ? `ยืนยันปิดทุกแมพใน ${seconds} วินาที?`
-        : `ยืนยันเปลี่ยนสถานะทุกแมพเป็น "${mode}"?`;
-
-
-    if (!confirm(message)) {
-        return;
-    }
-
-
-    try {
-
-        await api(
-            "/api/update-all",
-            {
-                method: "POST",
-
-                body: JSON.stringify({
-                    mode: mode,
-                    reason: reason,
-                    seconds: seconds
-                })
-            }
-        );
-
-
-        showToast(
-            "🌐 ดำเนินการกับทุกแมพสำเร็จ",
-            "success"
-        );
-
-
-        await loadMapState();
-
-    }
-    catch (error) {
-
-        showToast(
-            "❌ การควบคุมทุกแมพล้มเหลว: " +
-            error.message,
-            "error"
-        );
-    }
-}
-
-
-// ============================================================
-// TOKEN
-// ============================================================
-
-async function toggleToken() {
-
-    const pin =
-        document.getElementById(
-            "pinInput"
-        ).value;
-
+async function newToken() {
+    const pin = $("pinInput").value;
 
     if (!pin) {
-
-        showToast(
-            "กรุณากรอก PIN",
-            "error"
-        );
-
+        notify("กรุณากรอก Token PIN ก่อน", false);
         return;
     }
 
+    if (!confirm(
+        "สร้าง Token ใหม่หรือไม่?\n\n" +
+        "Token เดิมจะใช้กับ Roblox ไม่ได้อีกต่อไป"
+    )) return;
+
+    setBusy(true);
 
     try {
+        const data = await api("/api/new-token", {
+            method:"POST",
+            body:JSON.stringify({pin})
+        });
 
-        if (!tokenVisible) {
-
-            const data =
-                await api(
-                    "/api/token",
-                    {
-                        method: "POST",
-
-                        body: JSON.stringify({
-                            pin: pin
-                        })
-                    }
-                );
-
-            document.getElementById(
-                "tokenDisplay"
-            ).innerText =
-                data.token;
-
-            tokenVisible = true;
-
-        }
-        else {
-
-            document.getElementById(
-                "tokenDisplay"
-            ).innerText =
-                "••••••••••••••••••••••••••••••••";
-
-            tokenVisible = false;
-        }
-
-    }
-    catch (error) {
-
-        showToast(
-            "❌ " + error.message,
-            "error"
-        );
-    }
-}
-
-
-// ============================================================
-// NEW TOKEN
-// ============================================================
-
-async function generateNewToken() {
-
-    const pin =
-        document.getElementById(
-            "pinInput"
-        ).value;
-
-
-    if (!pin) {
-
-        showToast(
-            "กรุณากรอก PIN",
-            "error"
-        );
-
-        return;
-    }
-
-
-    if (
-        !confirm(
-            "⚠️ สร้าง Token ใหม่?\n\n" +
-            "Token เดิมจะใช้ไม่ได้ทันที"
-        )
-    ) {
-        return;
-    }
-
-
-    try {
-
-        const data =
-            await api(
-                "/api/new-token",
-                {
-                    method: "POST",
-
-                    body: JSON.stringify({
-                        pin: pin
-                    })
-                }
-            );
-
-
+        actualToken = data.token || "";
         tokenVisible = true;
+        $("tokenDisplay").textContent = actualToken;
 
-        document.getElementById(
-            "tokenDisplay"
-        ).innerText =
-            data.token;
-
-
-        showToast(
-            "🔄 สร้าง Token ใหม่สำเร็จ",
-            "success"
-        );
-
-    }
-    catch (error) {
-
-        showToast(
-            "❌ สร้าง Token ไม่สำเร็จ: " +
-            error.message,
-            "error"
-        );
+        notify("สร้าง Token ใหม่และบันทึกสำเร็จ");
+    } catch (err) {
+        notify("สร้าง Token ไม่สำเร็จ: " + err.message, false);
+    } finally {
+        setBusy(false);
     }
 }
-
-
-// ============================================================
-// REALTIME COUNTDOWN
-// ============================================================
 
 setInterval(() => {
+    if (!busy) refreshStatusOnly();
+}, 2000);
 
-    if (
-        !currentState ||
-        currentState.mode !== "scheduled" ||
-        !currentState.deadline
-    ) {
-        return;
-    }
-
-
-    const serverNow =
-        (
-            Date.now()
-            + serverOffset
-        ) / 1000;
-
-
-    const remaining =
-        Math.max(
-            0,
-            currentState.deadline
-            - serverNow
-        );
-
-
-    const elapsed =
-        Math.max(
-            0,
-            serverNow
-            - (
-                currentState.deadline
-                - currentState.seconds
-            )
-        );
-
-
-    const countdown =
-        document.getElementById(
-            "countdownTime"
-        );
-
-
-    if (countdown) {
-
-        countdown.innerText =
-            formatDuration(
-                remaining
-            );
-    }
-
-}, 250);
-
-
-// ============================================================
-// AUTO REFRESH
-// ============================================================
-
-setInterval(
-    loadMapState,
-    3000
-);
-
-
-// ============================================================
-// INITIAL
-// ============================================================
-
-toggleTimerInput();
-
-loadMapState();
-
+loadSelected();
 </script>
-
 </body>
 </html>
 """
 
 
 # ============================================================
-# ROUTES
+# Routes
 # ============================================================
 
 @app.route("/", methods=["GET", "POST"])
 def dashboard():
-
     if request.method == "POST":
+        supplied = request.form.get("password", "")
 
-        password =
-            request.form.get(
-                "password",
-                ""
-            )
-
-        if secrets.compare_digest(
-            password,
-            ADMIN_PASSWORD
-        ):
-
+        if secrets.compare_digest(supplied, ADMIN_PASSWORD):
             session.clear()
-
             session["admin_authenticated"] = True
-
             session.permanent = True
-
-            return redirect(
-                url_for("dashboard")
-            )
+            app.permanent_session_lifetime = 60 * 60 * 12
+            return redirect("/")
 
         return render_template_string(
             LOGIN_HTML,
-            error="รหัสผ่านไม่ถูกต้อง"
+            error="รหัสผ่านไม่ถูกต้อง",
         )
 
-
-    if not is_admin():
-
+    if not logged_in():
         return render_template_string(
             LOGIN_HTML,
-            error=None
+            error=None,
         )
-
 
     return render_template_string(
-        HTML_TEMPLATE,
-
+        DASHBOARD_HTML,
         maps=MAPS,
-
         default_reason=DEFAULT_REASON,
-
-        default_seconds=DEFAULT_SECONDS,
-
-        min_seconds=MIN_SECONDS,
-
-        max_seconds=MAX_SECONDS,
     )
 
-
-# ============================================================
-# LOGOUT
-# ============================================================
 
 @app.get("/logout")
 def logout():
-
     session.clear()
+    return redirect("/")
 
-    return redirect(
-        url_for("dashboard")
-    )
-
-
-# ============================================================
-# GET STATE
-# ============================================================
-
-@app.get("/api/state/<place_id>")
-def api_get_state(place_id):
-
-    auth_error = admin_required()
-
-    if auth_error:
-        return auth_error
-
-
-    if place_id not in MAPS.values():
-
-        return jsonify({
-            "success": False,
-            "error": "unknown place"
-        }), 404
-
-
-    response = jsonify(
-        snapshot(place_id)
-    )
-
-    response.headers[
-        "Cache-Control"
-    ] = "no-store, no-cache, must-revalidate"
-
-    return response
-
-
-# ============================================================
-# SAVE CONFIG
-# ============================================================
-
-@app.post("/api/save-config")
-def api_save_config():
-
-    auth_error = admin_required()
-
-    if auth_error:
-        return auth_error
-
-
-    req = request.get_json(
-        silent=True
-    ) or {}
-
-
-    pid = req.get(
-        "place_id"
-    )
-
-    reason = normalize_reason(
-        req.get("reason")
-    )
-
-    seconds = safe_int(
-        req.get("seconds"),
-        DEFAULT_SECONDS
-    )
-
-
-    # --------------------------------------------------------
-    # ALL
-    # --------------------------------------------------------
-
-    if pid == "ALL":
-
-        errors = []
-
-        for place_id in MAPS.values():
-
-            ok, message = update_state(
-                place_id,
-                reason=reason,
-                seconds=seconds
-            )
-
-            if not ok:
-                errors.append(
-                    f"{place_id}: {message}"
-                )
-
-
-        if errors:
-
-            return jsonify({
-                "success": False,
-                "error": "บางแมพบันทึกไม่สำเร็จ",
-                "details": errors
-            }), 503
-
-
-        return jsonify({
-            "success": True,
-            "message": "บันทึกทุกแมพสำเร็จ"
-        })
-
-
-    # --------------------------------------------------------
-    # SINGLE
-    # --------------------------------------------------------
-
-    if pid not in MAPS.values():
-
-        return jsonify({
-            "success": False,
-            "error": "unknown place"
-        }), 404
-
-
-    ok, message = update_state(
-        pid,
-        reason=reason,
-        seconds=seconds
-    )
-
-
-    if not ok:
-
-        return jsonify({
-            "success": False,
-            "error": "บันทึก Supabase ไม่สำเร็จ",
-            "details": message
-        }), 503
-
-
-    return jsonify({
-        "success": True,
-        "message": "บันทึกสำเร็จ"
-    })
-
-
-# ============================================================
-# UPDATE SINGLE
-# ============================================================
-
-@app.post("/api/update")
-def api_update():
-
-    auth_error = admin_required()
-
-    if auth_error:
-        return auth_error
-
-
-    req = request.get_json(
-        silent=True
-    ) or {}
-
-
-    pid = req.get(
-        "place_id"
-    )
-
-    mode = req.get(
-        "mode"
-    )
-
-    reason = normalize_reason(
-        req.get("reason")
-    )
-
-    seconds = safe_int(
-        req.get("seconds"),
-        DEFAULT_SECONDS
-    )
-
-
-    if pid not in MAPS.values():
-
-        return jsonify({
-            "success": False,
-            "error": "unknown place"
-        }), 404
-
-
-    if mode not in {
-        "open",
-        "closed",
-        "scheduled"
-    }:
-
-        return jsonify({
-            "success": False,
-            "error": "invalid mode"
-        }), 400
-
-
-    ok, message = update_state(
-        pid,
-        mode=mode,
-        reason=reason,
-        seconds=seconds
-    )
-
-
-    if not ok:
-
-        return jsonify({
-            "success": False,
-            "error": "บันทึกไม่สำเร็จ",
-            "details": message
-        }), 503
-
-
-    return jsonify({
-        "success": True,
-        "message": "คำสั่งถูกบันทึกแล้ว",
-        "state": snapshot(pid)
-    })
-
-
-# ============================================================
-# UPDATE ALL
-# ============================================================
-
-@app.post("/api/update-all")
-def api_update_all():
-
-    auth_error = admin_required()
-
-    if auth_error:
-        return auth_error
-
-
-    req = request.get_json(
-        silent=True
-    ) or {}
-
-
-    mode = req.get(
-        "mode"
-    )
-
-    reason = normalize_reason(
-        req.get("reason")
-    )
-
-    seconds = safe_int(
-        req.get("seconds"),
-        DEFAULT_SECONDS
-    )
-
-
-    if mode not in {
-        "open",
-        "closed",
-        "scheduled"
-    }:
-
-        return jsonify({
-            "success": False,
-            "error": "invalid mode"
-        }), 400
-
-
-    errors = []
-
-
-    with LOCK:
-
-        # ----------------------------------------------------
-        # สร้าง state ใหม่ก่อน
-        # ----------------------------------------------------
-
-        candidates = {}
-
-        for place_id in MAPS.values():
-
-            old_state = copy.deepcopy(
-                DATA["places"][place_id]
-            )
-
-            new_state = copy.deepcopy(
-                old_state
-            )
-
-            new_state["mode"] = mode
-            new_state["reason"] = reason
-            new_state["seconds"] = seconds
-
-
-            if mode == "scheduled":
-
-                new_state["deadline"] = (
-                    now_ts() + seconds
-                )
-
-            else:
-
-                new_state["deadline"] = None
-
-
-            candidates[place_id] = new_state
-
-
-        # ----------------------------------------------------
-        # Save ทุกแมพ
-        # ----------------------------------------------------
-
-        saved = []
-
-        for place_id, state in candidates.items():
-
-            if save_record_to_supabase(
-                place_id,
-                state
-            ):
-
-                saved.append(
-                    place_id
-                )
-
-            else:
-
-                errors.append(
-                    place_id
-                )
-
-
-        # ----------------------------------------------------
-        # ถ้ามีแมพใด save ไม่สำเร็จ
-        # ----------------------------------------------------
-
-        if errors:
-
-            # พยายาม rollback แมพที่ save ไปแล้ว
-            for place_id in saved:
-
-                old_state = DATA["places"].get(
-                    place_id
-                )
-
-                if old_state:
-
-                    save_record_to_supabase(
-                        place_id,
-                        old_state
-                    )
-
-
-            return jsonify({
-                "success": False,
-                "error": "ไม่สามารถบันทึกทุกแมพได้",
-                "failed_places": errors
-            }), 503
-
-
-        # ----------------------------------------------------
-        # ทุกแมพสำเร็จ → commit memory
-        # ----------------------------------------------------
-
-        for place_id, state in candidates.items():
-
-            DATA["places"][place_id] = (
-                copy.deepcopy(state)
-            )
-
-
-        save_local_backup()
-
-
-    return jsonify({
-        "success": True,
-        "message": "บันทึกทุกแมพสำเร็จ"
-    })
-
-
-# ============================================================
-# TOKEN VIEW
-# ============================================================
-
-@app.post("/api/token")
-def api_token():
-
-    auth_error = admin_required()
-
-    if auth_error:
-        return auth_error
-
-
-    req = request.get_json(
-        silent=True
-    ) or {}
-
-
-    pin = str(
-        req.get("pin", "")
-    )
-
-
-    if not secrets.compare_digest(
-        pin,
-        TOKEN_PIN
-    ):
-
-        return jsonify({
-            "success": False,
-            "error": "PIN ไม่ถูกต้อง"
-        }), 403
-
-
-    return jsonify({
-        "success": True,
-        "token": DATA["token"]
-    })
-
-
-# ============================================================
-# NEW TOKEN
-# ============================================================
-
-@app.post("/api/new-token")
-def api_new_token():
-
-    auth_error = admin_required()
-
-    if auth_error:
-        return auth_error
-
-
-    req = request.get_json(
-        silent=True
-    ) or {}
-
-
-    pin = str(
-        req.get("pin", "")
-    )
-
-
-    if not secrets.compare_digest(
-        pin,
-        TOKEN_PIN
-    ):
-
-        return jsonify({
-            "success": False,
-            "error": "PIN ไม่ถูกต้อง"
-        }), 403
-
-
-    with LOCK:
-
-        new_token = secrets.token_urlsafe(
-            32
-        )
-
-
-        token_state = {
-            "mode": "token",
-            "reason": new_token,
-            "deadline": None,
-            "seconds": DEFAULT_SECONDS,
-        }
-
-
-        if not save_record_to_supabase(
-            SYSTEM_TOKEN_ID,
-            token_state
-        ):
-
-            return jsonify({
-                "success": False,
-                "error":
-                    "ไม่สามารถบันทึก Token ใหม่ลง Supabase"
-            }), 503
-
-
-        DATA["token"] = new_token
-
-        save_local_backup()
-
-
-        return jsonify({
-            "success": True,
-            "token": new_token
-        })
-
-
-# ============================================================
-# ROBLOX API
-# ============================================================
-
-@app.get("/state/<place_id>")
-def get_state(place_id):
-
-    expected =
-        "Bearer " + DATA["token"]
-
-    supplied =
-        request.headers.get(
-            "Authorization",
-            ""
-        )
-
-
-    if not secrets.compare_digest(
-        supplied,
-        expected
-    ):
-
-        return jsonify({
-            "error": "unauthorized"
-        }), 401
-
-
-    if place_id not in MAPS.values():
-
-        return jsonify({
-            "error": "unknown place"
-        }), 404
-
-
-    response = jsonify(
-        snapshot(place_id)
-    )
-
-
-    response.headers[
-        "Cache-Control"
-    ] = (
-        "no-store, "
-        "no-cache, "
-        "must-revalidate, "
-        "max-age=0"
-    )
-
-
-    return response
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
 
 @app.get("/health")
 def health():
-
     return jsonify({
-        "status": "ok",
-        "serverTime": now_ts(),
-        "places": len(
-            DATA["places"]
-        )
+        "ok": True,
+        "database": DB_AVAILABLE,
+        "time": time.time(),
+        "maps": len(PLACE_IDS),
     })
 
 
+@app.get("/api/state/<place_id>")
+@login_required
+def api_get_state(place_id):
+    if place_id not in PLACE_IDS:
+        return jsonify({"error": "unknown place"}), 404
+
+    result = snapshot(place_id)
+
+    for name, pid in MAPS.items():
+        if pid == place_id:
+            result["name"] = name
+            break
+
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.get("/api/states")
+@login_required
+def api_get_states():
+    states = []
+
+    for name, pid in MAPS.items():
+        state = snapshot(pid)
+        state["name"] = name
+        state["place_id"] = pid
+        states.append(state)
+
+    response = jsonify({
+        "states": states,
+        "serverNow": time.time(),
+        "database": DB_AVAILABLE,
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+@app.post("/api/save-config")
+@login_required
+def api_save_config():
+    req = request.get_json(silent=True) or {}
+
+    pid = req.get("place_id")
+    reason = normalize_reason(req.get("reason"))
+    seconds = normalize_seconds(req.get("seconds", 60))
+
+    if pid == "ALL":
+        updated = []
+
+        try:
+            for place_id in PLACE_IDS:
+                updated.append(
+                    update_state(
+                        place_id,
+                        reason=reason,
+                        seconds=seconds,
+                    )
+                )
+        except Exception as exc:
+            return jsonify({
+                "error": str(exc),
+                "success": False,
+            }), 503
+
+        return jsonify({
+            "success": True,
+            "message": f"บันทึกข้อมูล {len(updated)} แมพสำเร็จ",
+        })
+
+    if pid not in PLACE_IDS:
+        return jsonify({"error": "unknown place"}), 404
+
+    try:
+        state = update_state(
+            pid,
+            reason=reason,
+            seconds=seconds,
+        )
+    except Exception as exc:
+        return jsonify({
+            "error": str(exc),
+            "success": False,
+        }), 503
+
+    return jsonify({
+        "success": True,
+        "message": "บันทึกข้อมูลสำเร็จ",
+        "state": state,
+    })
+
+
+@app.post("/api/update")
+@login_required
+def api_update():
+    req = request.get_json(silent=True) or {}
+
+    pid = req.get("place_id")
+    mode = req.get("mode")
+    reason = req.get("reason")
+    seconds = req.get("seconds")
+
+    if pid not in PLACE_IDS:
+        return jsonify({"error": "unknown place"}), 404
+
+    if mode not in {"open", "scheduled", "closed"}:
+        return jsonify({"error": "invalid mode"}), 400
+
+    try:
+        state = update_state(
+            pid,
+            mode=mode,
+            reason=reason,
+            seconds=seconds,
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({
+            "error": str(exc),
+            "success": False,
+        }), 503
+
+    return jsonify({
+        "success": True,
+        "message": "บันทึกคำสั่งสำเร็จ",
+        "state": state,
+    })
+
+
+@app.post("/api/update-all")
+@login_required
+def api_update_all():
+    req = request.get_json(silent=True) or {}
+
+    mode = req.get("mode")
+    reason = req.get("reason")
+    seconds = req.get("seconds")
+
+    if mode not in {"open", "scheduled", "closed"}:
+        return jsonify({"error": "invalid mode"}), 400
+
+    try:
+        for pid in PLACE_IDS:
+            update_state(
+                pid,
+                mode=mode,
+                reason=reason,
+                seconds=seconds,
+            )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({
+            "error": str(exc),
+            "success": False,
+        }), 503
+
+    return jsonify({
+        "success": True,
+        "message": f"บันทึกคำสั่ง {len(PLACE_IDS)} แมพสำเร็จ",
+    })
+
+
+@app.post("/api/token")
+@login_required
+def api_token():
+    req = request.get_json(silent=True) or {}
+    pin = req.get("pin")
+
+    if not verify_token_pin(pin):
+        return jsonify({"error": "invalid pin"}), 401
+
+    with LOCK:
+        if not DATA.get("token"):
+            return jsonify({"error": "token unavailable"}), 503
+
+        return jsonify({
+            "success": True,
+            "token": DATA["token"],
+        })
+
+
+@app.post("/api/new-token")
+@login_required
+def api_new_token():
+    req = request.get_json(silent=True) or {}
+    pin = req.get("pin")
+
+    if not verify_token_pin(pin):
+        return jsonify({"error": "invalid pin"}), 401
+
+    with LOCK:
+        old_token = DATA.get("token")
+        new_token = secrets.token_urlsafe(32)
+
+        ok, error = save_with_retry(
+            SYSTEM_TOKEN_ID,
+            {"token": new_token},
+            retries=3,
+        )
+
+        if not ok:
+            DATA["token"] = old_token
+            return jsonify({
+                "error": f"ไม่สามารถบันทึก Token ใหม่ได้: {error}",
+                "success": False,
+            }), 503
+
+        DATA["token"] = new_token
+
+        LOG.warning("Admin generated a new Roblox API token.")
+
+        return jsonify({
+            "success": True,
+            "token": new_token,
+        })
+
+
 # ============================================================
-# MAIN
+# Roblox API
 # ============================================================
+
+@app.get("/state/<place_id>")
+def roblox_state(place_id):
+    """
+    Roblox-facing endpoint.
+
+    Authorization:
+        Bearer <TOKEN>
+
+    Example:
+        GET /state/120651982896178
+        Authorization: Bearer YOUR_TOKEN
+    """
+    if place_id not in PLACE_IDS:
+        return jsonify({"error": "unknown place"}), 404
+
+    supplied = request.headers.get("Authorization", "")
+    expected = f"Bearer {DATA.get('token', '')}"
+
+    if not DATA.get("token"):
+        return jsonify({"error": "service unavailable"}), 503
+
+    if not secrets.compare_digest(supplied, expected):
+        return jsonify({"error": "unauthorized"}), 401
+
+    result = snapshot(place_id)
+
+    # Keep this endpoint focused and stable for Roblox.
+    result.pop("dbAvailable", None)
+    result.pop("lastDbSync", None)
+
+    response = jsonify(result)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+    response.headers["Pragma"] = "no-cache"
+    return response
+
+
+# ============================================================
+# Startup
+# ============================================================
+
+def startup():
+    LOG.info("=" * 60)
+    LOG.info("Roblox Control Center starting...")
+    LOG.info("Maps: %s", len(MAPS))
+    LOG.info("Port: %s", PORT)
+    LOG.info("Supabase: %s", SUPABASE_URL)
+    LOG.info("=" * 60)
+
+    initialize_database()
+
+    if DATA.get("token"):
+        LOG.info("API token loaded successfully.")
+    else:
+        LOG.error("API token is unavailable.")
+
+    LOG.info("Startup complete.")
+
 
 if __name__ == "__main__":
-
-    print("=" * 60)
-    print("Roblox Control Center")
-    print("=" * 60)
-
-    print(
-        f"Server: http://{HOST}:{PORT}"
-    )
-
-    print(
-        f"Maps: {len(MAPS)}"
-    )
-
-    print(
-        f"Backup: {BACKUP_FILE}"
-    )
-
-    print("=" * 60)
+    startup()
 
     serve(
         app,
         host=HOST,
         port=PORT,
-        threads=8
+        threads=8,
+        connection_limit=100,
+        channel_timeout=30,
+        cleanup_interval=10,
     )
