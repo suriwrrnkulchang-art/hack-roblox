@@ -61,7 +61,7 @@ def env_required(name: str) -> str:
     return value
 
 
-ADMIN_PASSWORD = env_required("6155045")
+ADMIN_PASSWORD = env_required("991675788")
 TOKEN_PIN = env_required("6155045")
 SUPABASE_URL = env_required("https://roiuyoflkmftbxtdeuax.supabase.co").rstrip("/")
 SUPABASE_KEY = env_required("sb_publishable_u3rUgrL7oM5FoolIFy0ocA_MsyiuPoh")
