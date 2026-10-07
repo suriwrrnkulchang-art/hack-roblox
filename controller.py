@@ -27,10 +27,10 @@ from flask import Flask, jsonify, redirect, render_template_string, request, ses
 from waitress import serve
 
 # ---------------------------------------------------------------- ตั้งค่า
-ADMIN_PASSWORD = os.environ.get("6155045", "")
-TOKEN_PIN = os.environ.get("991675788", "")
-SUPABASE_URL = os.environ.get("roblox-control-center-service.onrender.com", "").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "6155045")
+TOKEN_PIN = os.environ.get("TOKEN_PIN", "991675788")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://roiuyoflkmftbxtdeuax.supabase.co").rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_WfO5ZgoulLDCVmTx_rZcMg_Q0zroFa1")
 LOCAL_FILE = os.environ.get("LOCAL_FILE", "control_state.json")
 HOST = "0.0.0.0"
 PORT = int(os.environ.get("PORT", 8888))
