@@ -41,9 +41,7 @@ from waitress import serve
 # CONTROL_BACKUP_FILE=control_backup.json
 #
 #
-# Supabase table:
-#
-# control_state
+# Supabase table: control_state
 #
 # Required columns:
 #
@@ -87,7 +85,6 @@ def env_required(name: str) -> str:
 ADMIN_PASSWORD = env_required("ADMIN_PASSWORD")
 TOKEN_PIN = env_required("TOKEN_PIN")
 SECRET_KEY = env_required("SECRET_KEY")
-
 SUPABASE_URL = env_required("SUPABASE_URL").rstrip("/")
 SUPABASE_KEY = env_required("SUPABASE_KEY")
 
@@ -126,7 +123,7 @@ MAPS = {
 
 PLACE_IDS = tuple(MAPS.values())
 
-SYSTEM_TOKEN_ID = "__SYS_TOKEN__"
+SYSTEM_TOKEN_ID = "**SYS_TOKEN**"
 
 
 # ============================================================
@@ -142,7 +139,11 @@ SUPABASE_TIMEOUT = 8
 
 SAVE_RETRIES = 3
 
-BACKUP_VERSION = 1
+VERIFY_RETRIES = 3
+
+VERIFY_DELAY = 0.20
+
+BACKUP_VERSION = 2
 
 
 # ============================================================
@@ -151,6 +152,8 @@ BACKUP_VERSION = 1
 
 LOCK = threading.RLock()
 
+# สำคัญ:
+# ทุกการเขียน Supabase ต้องผ่าน lock นี้
 WRITE_LOCK = threading.Lock()
 
 BACKUP_LOCK = threading.Lock()
@@ -163,23 +166,16 @@ INIT_LOCK = threading.Lock()
 # ============================================================
 
 DB_AVAILABLE = False
-
 LAST_DB_SYNC = None
-
 LAST_DB_ERROR = None
 
 BACKUP_AVAILABLE = False
-
 LAST_BACKUP_SAVE = None
-
 LAST_BACKUP_ERROR = None
 
 INITIALIZED = False
-
 LAST_INIT_ATTEMPT = 0.0
 
-
-# Prevent multiple transition-save threads
 TRANSITION_PENDING = set()
 
 
@@ -198,8 +194,7 @@ app.config.update(
         os.environ.get(
             "COOKIE_SECURE",
             "1",
-        )
-        == "1"
+        ) == "1"
     ),
     MAX_CONTENT_LENGTH=1024 * 1024,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
@@ -230,11 +225,12 @@ DATA = {
 
 
 # ============================================================
-# Cache Control
+# No Cache
 # ============================================================
 
 @app.after_request
 def add_no_cache_headers(response):
+
     if (
         request.path.startswith("/api/")
         or request.path.startswith("/state/")
@@ -245,7 +241,6 @@ def add_no_cache_headers(response):
         )
 
         response.headers["Pragma"] = "no-cache"
-
         response.headers["Expires"] = "0"
 
     return response
@@ -272,12 +267,14 @@ def logged_in():
 
 
 def login_required(view):
+
     @wraps(view)
     def wrapped(*args, **kwargs):
 
         if not logged_in():
 
             if request.path.startswith("/api/"):
+
                 return jsonify({
                     "ok": False,
                     "error": "unauthorized",
@@ -305,6 +302,7 @@ def verify_token_pin(value):
 # ============================================================
 
 def request_json():
+
     data = request.get_json(
         silent=True
     )
@@ -325,6 +323,7 @@ def request_json():
 # ============================================================
 
 def normalize_seconds(value, default=60):
+
     if value is None:
         value = default
 
@@ -353,6 +352,7 @@ def normalize_seconds(value, default=60):
 
 
 def normalize_reason(value):
+
     if value is None:
         return DEFAULT_REASON
 
@@ -365,6 +365,7 @@ def normalize_reason(value):
 
 
 def normalize_timestamp(value):
+
     if value is None:
         return None
 
@@ -379,6 +380,7 @@ def normalize_timestamp(value):
 
 
 def clean_state(state):
+
     if not isinstance(state, dict):
         state = default_state()
 
@@ -396,21 +398,25 @@ def clean_state(state):
 
     return {
         "mode": mode,
+
         "reason": normalize_reason(
             state.get(
                 "reason",
                 DEFAULT_REASON,
             )
         ),
+
         "deadline": normalize_timestamp(
             state.get("deadline")
         ),
+
         "seconds": normalize_seconds(
             state.get(
                 "seconds",
                 60,
             )
         ),
+
         "commandStartedAt": normalize_timestamp(
             state.get(
                 "commandStartedAt"
@@ -424,6 +430,7 @@ def clean_state(state):
 # ============================================================
 
 def supabase_headers(prefer=None):
+
     headers = {
         "apikey": SUPABASE_KEY,
         "Authorization": (
@@ -450,6 +457,7 @@ def supabase_request(
     timeout=SUPABASE_TIMEOUT,
     prefer=None,
 ):
+
     url = (
         f"{SUPABASE_URL}/rest/v1/"
         f"{path.lstrip('/')}"
@@ -464,6 +472,7 @@ def supabase_request(
     body = None
 
     if payload is not None:
+
         body = json.dumps(
             payload,
             ensure_ascii=False,
@@ -479,6 +488,7 @@ def supabase_request(
     )
 
     try:
+
         with urllib.request.urlopen(
             req,
             timeout=timeout,
@@ -493,20 +503,24 @@ def supabase_request(
                 return None
 
             try:
+
                 return json.loads(raw)
 
             except json.JSONDecodeError:
+
                 return raw
 
     except urllib.error.HTTPError as exc:
 
         try:
+
             detail = exc.read().decode(
                 "utf-8",
                 errors="replace",
             )
 
         except Exception:
+
             detail = str(exc)
 
         raise RuntimeError(
@@ -530,6 +544,7 @@ def supabase_request(
 # ============================================================
 
 def load_from_supabase():
+
     global DB_AVAILABLE
     global LAST_DB_SYNC
     global LAST_DB_ERROR
@@ -588,7 +603,7 @@ def load_from_supabase():
             continue
 
         # ----------------------------------------------------
-        # Ignore unknown place
+        # Ignore unknown Place
         # ----------------------------------------------------
 
         if place_id not in PLACE_IDS:
@@ -613,6 +628,7 @@ def load_from_supabase():
         )
 
         try:
+
             seconds = normalize_seconds(
                 row.get(
                     "seconds",
@@ -621,6 +637,7 @@ def load_from_supabase():
             )
 
         except ValueError:
+
             seconds = 60
 
         deadline = normalize_timestamp(
@@ -657,25 +674,24 @@ def load_from_supabase():
         )
 
     DB_AVAILABLE = True
-
     LAST_DB_SYNC = time.time()
-
     LAST_DB_ERROR = None
 
     return result
 
 
 # ============================================================
-# Save To Supabase
+# Build Supabase Payload
 # ============================================================
 
-def save_to_supabase(
+def build_supabase_payload(
     place_id,
     state_data,
 ):
+
     if place_id == SYSTEM_TOKEN_ID:
 
-        payload = {
+        return {
             "place_id": SYSTEM_TOKEN_ID,
             "mode": "token",
             "reason": str(
@@ -686,26 +702,49 @@ def save_to_supabase(
             "command_started_at": None,
         }
 
-    else:
+    state_data = clean_state(
+        state_data
+    )
 
-        state_data = clean_state(
-            state_data
-        )
+    return {
+        "place_id": place_id,
 
-        payload = {
-            "place_id": place_id,
-            "mode": state_data["mode"],
-            "reason": state_data["reason"],
-            "deadline": state_data["deadline"],
-            "seconds": state_data["seconds"],
-            "command_started_at": (
-                state_data[
-                    "commandStartedAt"
-                ]
-            ),
-        }
+        "mode": state_data["mode"],
 
-    return supabase_request(
+        "reason": state_data["reason"],
+
+        "deadline": state_data["deadline"],
+
+        "seconds": state_data["seconds"],
+
+        "command_started_at": (
+            state_data[
+                "commandStartedAt"
+            ]
+        ),
+    }
+
+
+# ============================================================
+# Save To Supabase
+#
+# IMPORTANT:
+# Save -> Return Representation -> Verify
+#
+# นี่คือส่วนสำคัญที่แก้ปัญหา Save แล้วกลับค่าเก่า
+# ============================================================
+
+def save_to_supabase(
+    place_id,
+    state_data,
+):
+
+    payload = build_supabase_payload(
+        place_id,
+        state_data,
+    )
+
+    result = supabase_request(
         "POST",
         "control_state",
         payload=payload,
@@ -714,13 +753,175 @@ def save_to_supabase(
         },
         prefer=(
             "resolution=merge-duplicates,"
-            "return=minimal"
+            "return=representation"
         ),
     )
 
+    # --------------------------------------------------------
+    # Token
+    # --------------------------------------------------------
+
+    if place_id == SYSTEM_TOKEN_ID:
+
+        if not isinstance(result, list):
+            raise RuntimeError(
+                "Supabase ไม่คืนข้อมูล Token หลังบันทึก"
+            )
+
+        if not result:
+            raise RuntimeError(
+                "Supabase ไม่พบข้อมูล Token หลังบันทึก"
+            )
+
+        saved_token = str(
+            result[0].get(
+                "reason",
+                ""
+            )
+        )
+
+        if saved_token != str(
+            state_data["token"]
+        ):
+            raise RuntimeError(
+                "Token ที่ Supabase บันทึก "
+                "ไม่ตรงกับ Token ใหม่"
+            )
+
+        return result
+
+    # --------------------------------------------------------
+    # Normal State
+    # --------------------------------------------------------
+
+    if not isinstance(result, list):
+
+        raise RuntimeError(
+            "Supabase ไม่คืนข้อมูลหลังบันทึก"
+        )
+
+    if not result:
+
+        raise RuntimeError(
+            "Supabase ไม่คืนแถวที่บันทึกกลับมา"
+        )
+
+    saved = result[0]
+
+    # --------------------------------------------------------
+    # Verify place_id
+    # --------------------------------------------------------
+
+    if str(
+        saved.get("place_id")
+    ) != place_id:
+
+        raise RuntimeError(
+            "Supabase บันทึกผิด place_id"
+        )
+
+    # --------------------------------------------------------
+    # Verify mode
+    # --------------------------------------------------------
+
+    if saved.get(
+        "mode"
+    ) != payload["mode"]:
+
+        raise RuntimeError(
+            "Supabase บันทึก mode "
+            "ไม่ตรงกับค่าที่ส่ง"
+        )
+
+    # --------------------------------------------------------
+    # Verify reason
+    # --------------------------------------------------------
+
+    saved_reason = normalize_reason(
+        saved.get("reason")
+    )
+
+    expected_reason = normalize_reason(
+        payload["reason"]
+    )
+
+    if saved_reason != expected_reason:
+
+        raise RuntimeError(
+            "Supabase บันทึก reason "
+            "ไม่ตรงกับค่าที่ส่ง"
+        )
+
+    # --------------------------------------------------------
+    # Verify seconds
+    # --------------------------------------------------------
+
+    try:
+
+        saved_seconds = normalize_seconds(
+            saved.get(
+                "seconds",
+                60,
+            )
+        )
+
+    except ValueError:
+
+        raise RuntimeError(
+            "Supabase ส่งค่า seconds "
+            "ที่ไม่ถูกต้องกลับมา"
+        )
+
+    if saved_seconds != payload["seconds"]:
+
+        raise RuntimeError(
+            "Supabase บันทึก seconds "
+            "ไม่ตรงกับค่าที่ส่ง"
+        )
+
+    # --------------------------------------------------------
+    # Verify deadline
+    # --------------------------------------------------------
+
+    saved_deadline = normalize_timestamp(
+        saved.get("deadline")
+    )
+
+    expected_deadline = normalize_timestamp(
+        payload["deadline"]
+    )
+
+    if (
+        saved_deadline is None
+        and expected_deadline is None
+    ):
+        pass
+
+    elif (
+        saved_deadline is None
+        or expected_deadline is None
+    ):
+
+        raise RuntimeError(
+            "Supabase บันทึก deadline "
+            "ไม่ตรงกับค่าที่ส่ง"
+        )
+
+    elif abs(
+        saved_deadline
+        - expected_deadline
+    ) > 0.001:
+
+        raise RuntimeError(
+            "Supabase บันทึก deadline "
+            "ไม่ตรงกับค่าที่ส่ง"
+        )
+
+    return saved
+
 
 # ============================================================
-# Supabase Retry
+# Save With Retry
 # ============================================================
 
 def save_with_retry(
@@ -728,6 +929,7 @@ def save_with_retry(
     state_data,
     retries=SAVE_RETRIES,
 ):
+
     global DB_AVAILABLE
     global LAST_DB_SYNC
     global LAST_DB_ERROR
@@ -741,18 +943,16 @@ def save_with_retry(
 
         try:
 
-            save_to_supabase(
+            saved = save_to_supabase(
                 place_id,
                 state_data,
             )
 
             DB_AVAILABLE = True
-
             LAST_DB_SYNC = time.time()
-
             LAST_DB_ERROR = None
 
-            return True, None
+            return True, None, saved
 
         except Exception as exc:
 
@@ -777,6 +977,213 @@ def save_with_retry(
 
     DB_AVAILABLE = False
 
+    return False, last_error, None
+
+
+# ============================================================
+# Verify Database State
+#
+# หลังเขียนเสร็จ อ่านกลับอีกครั้ง
+# เพื่อป้องกันกรณีมี process/server อื่นเขียนทับ
+# ============================================================
+
+def verify_database_state(
+    place_id,
+    expected_state,
+    retries=VERIFY_RETRIES,
+):
+
+    if place_id == SYSTEM_TOKEN_ID:
+
+        expected_token = str(
+            expected_state["token"]
+        )
+
+        for attempt in range(
+            1,
+            retries + 1,
+        ):
+
+            try:
+
+                rows = supabase_request(
+                    "GET",
+                    "control_state",
+                    query={
+                        "select": "place_id,reason",
+                        "place_id": f"eq.{SYSTEM_TOKEN_ID}",
+                    },
+                )
+
+                if (
+                    isinstance(rows, list)
+                    and rows
+                ):
+
+                    actual = str(
+                        rows[0].get(
+                            "reason",
+                            ""
+                        )
+                    )
+
+                    if actual == expected_token:
+                        return True, None
+
+            except Exception as exc:
+
+                LOG.warning(
+                    "Token verification failed: %s",
+                    exc,
+                )
+
+            if attempt < retries:
+                time.sleep(
+                    VERIFY_DELAY
+                )
+
+        return False, (
+            "ตรวจสอบ Token หลังบันทึกไม่สำเร็จ"
+        )
+
+    expected = clean_state(
+        expected_state
+    )
+
+    for attempt in range(
+        1,
+        retries + 1,
+    ):
+
+        try:
+
+            rows = supabase_request(
+                "GET",
+                "control_state",
+                query={
+                    "select": (
+                        "place_id,"
+                        "mode,"
+                        "reason,"
+                        "deadline,"
+                        "seconds,"
+                        "command_started_at"
+                    ),
+                    "place_id": (
+                        f"eq.{place_id}"
+                    ),
+                },
+            )
+
+            if (
+                not isinstance(rows, list)
+                or not rows
+            ):
+
+                raise RuntimeError(
+                    "ไม่พบข้อมูลใน Supabase"
+                )
+
+            row = rows[0]
+
+            actual = clean_state({
+                "mode": row.get(
+                    "mode"
+                ),
+
+                "reason": row.get(
+                    "reason"
+                ),
+
+                "deadline": row.get(
+                    "deadline"
+                ),
+
+                "seconds": row.get(
+                    "seconds"
+                ),
+
+                "commandStartedAt": row.get(
+                    "command_started_at"
+                ),
+            })
+
+            # ------------------------------------------------
+            # Compare
+            # ------------------------------------------------
+
+            if actual["mode"] != expected["mode"]:
+
+                raise RuntimeError(
+                    "mode ไม่ตรง"
+                )
+
+            if actual["reason"] != expected["reason"]:
+
+                raise RuntimeError(
+                    "reason ไม่ตรง"
+                )
+
+            if actual["seconds"] != expected["seconds"]:
+
+                raise RuntimeError(
+                    "seconds ไม่ตรง"
+                )
+
+            # Deadline
+            expected_deadline = expected[
+                "deadline"
+            ]
+
+            actual_deadline = actual[
+                "deadline"
+            ]
+
+            if (
+                expected_deadline is None
+                and actual_deadline is None
+            ):
+                pass
+
+            elif (
+                expected_deadline is None
+                or actual_deadline is None
+            ):
+
+                raise RuntimeError(
+                    "deadline ไม่ตรง"
+                )
+
+            elif abs(
+                expected_deadline
+                - actual_deadline
+            ) > 0.001:
+
+                raise RuntimeError(
+                    "deadline ไม่ตรง"
+                )
+
+            return True, None
+
+        except Exception as exc:
+
+            last_error = str(exc)
+
+            LOG.warning(
+                "Database verification "
+                "(%s/%s) failed for %s: %s",
+                attempt,
+                retries,
+                place_id,
+                last_error,
+            )
+
+            if attempt < retries:
+
+                time.sleep(
+                    VERIFY_DELAY
+                )
+
     return False, last_error
 
 
@@ -785,7 +1192,9 @@ def save_with_retry(
 # ============================================================
 
 def backup_payload():
+
     with LOCK:
+
         return {
             "version": BACKUP_VERSION,
             "savedAt": time.time(),
@@ -800,6 +1209,7 @@ def backup_payload():
 
 
 def save_local_backup():
+
     global BACKUP_AVAILABLE
     global LAST_BACKUP_SAVE
     global LAST_BACKUP_ERROR
@@ -849,10 +1259,10 @@ def save_local_backup():
                 BACKUP_FILE,
             )
 
-        # Best effort restrictive permissions
         if os.name != "nt":
 
             try:
+
                 os.chmod(
                     BACKUP_FILE,
                     0o600,
@@ -862,9 +1272,7 @@ def save_local_backup():
                 pass
 
         BACKUP_AVAILABLE = True
-
         LAST_BACKUP_SAVE = time.time()
-
         LAST_BACKUP_ERROR = None
 
         return True, None
@@ -872,7 +1280,6 @@ def save_local_backup():
     except Exception as exc:
 
         BACKUP_AVAILABLE = False
-
         LAST_BACKUP_ERROR = str(exc)
 
         LOG.error(
@@ -881,9 +1288,11 @@ def save_local_backup():
         )
 
         try:
+
             if os.path.exists(
                 temp_file
             ):
+
                 os.remove(
                     temp_file
                 )
@@ -895,6 +1304,7 @@ def save_local_backup():
 
 
 def load_local_backup():
+
     global BACKUP_AVAILABLE
     global LAST_BACKUP_ERROR
 
@@ -924,6 +1334,7 @@ def load_local_backup():
             payload,
             dict,
         ):
+
             raise RuntimeError(
                 "Backup format invalid."
             )
@@ -941,6 +1352,7 @@ def load_local_backup():
             places,
             dict,
         ):
+
             raise RuntimeError(
                 "Backup places invalid."
             )
@@ -955,6 +1367,7 @@ def load_local_backup():
                 raw,
                 dict,
             ):
+
                 raw = default_state()
 
             clean_places[pid] = clean_state(
@@ -962,7 +1375,6 @@ def load_local_backup():
             )
 
         BACKUP_AVAILABLE = True
-
         LAST_BACKUP_ERROR = None
 
         return {
@@ -971,13 +1383,13 @@ def load_local_backup():
                 if token
                 else None
             ),
+
             "places": clean_places,
         }
 
     except Exception as exc:
 
         BACKUP_AVAILABLE = False
-
         LAST_BACKUP_ERROR = str(exc)
 
         LOG.error(
@@ -993,6 +1405,7 @@ def load_local_backup():
 # ============================================================
 
 def initialize_database():
+
     global INITIALIZED
     global DB_AVAILABLE
 
@@ -1022,6 +1435,7 @@ def initialize_database():
                 )
 
                 if backup.get("token"):
+
                     DATA["token"] = (
                         backup["token"]
                     )
@@ -1051,7 +1465,7 @@ def initialize_database():
             )
 
     # --------------------------------------------------------
-    # Create Token if missing
+    # Create Token
     # --------------------------------------------------------
 
     if not DATA.get("token"):
@@ -1060,7 +1474,7 @@ def initialize_database():
             32
         )
 
-        ok, error = save_with_retry(
+        ok, error, _ = save_with_retry(
             SYSTEM_TOKEN_ID,
             {
                 "token": new_token
@@ -1077,10 +1491,11 @@ def initialize_database():
             return False
 
         with LOCK:
+
             DATA["token"] = new_token
 
     # --------------------------------------------------------
-    # Create missing places
+    # Create Missing Places
     # --------------------------------------------------------
 
     for pid in loaded.get(
@@ -1090,7 +1505,7 @@ def initialize_database():
 
         state = default_state()
 
-        ok, error = save_with_retry(
+        ok, error, _ = save_with_retry(
             pid,
             state,
         )
@@ -1114,7 +1529,7 @@ def initialize_database():
             )
 
     # --------------------------------------------------------
-    # Save known-good backup
+    # Backup
     # --------------------------------------------------------
 
     save_local_backup()
@@ -1129,6 +1544,7 @@ def initialize_database():
 
 
 def ensure_db_loaded():
+
     global LAST_INIT_ATTEMPT
 
     if INITIALIZED:
@@ -1165,15 +1581,7 @@ def ensure_db_loaded():
 # Build Expired View
 # ============================================================
 
-def build_expired_state(
-    state,
-):
-    """
-    Creates a CLOSED view when a scheduled timer expires.
-
-    IMPORTANT:
-    This function DOES NOT modify DATA.
-    """
+def build_expired_state(state):
 
     view = copy.deepcopy(
         state
@@ -1203,6 +1611,7 @@ def persist_transition(
     place_id,
     expected_deadline,
 ):
+
     try:
 
         with WRITE_LOCK:
@@ -1213,14 +1622,14 @@ def persist_transition(
                     DATA["places"][place_id]
                 )
 
-            # Someone may have changed the map
-            # while the background task was waiting.
+            # ถ้ามีคนแก้ state แล้ว ไม่ทำอะไร
             if (
                 current["mode"]
                 != "scheduled"
                 or current["deadline"]
                 != expected_deadline
             ):
+
                 return
 
             new_state = copy.deepcopy(
@@ -1229,13 +1638,11 @@ def persist_transition(
 
             new_state["mode"] = "closed"
 
-            # Keep deadline as the actual close time.
-            # This preserves historical timing.
             new_state["deadline"] = (
                 expected_deadline
             )
 
-            ok, error = save_with_retry(
+            ok, error, _ = save_with_retry(
                 place_id,
                 new_state,
                 retries=2,
@@ -1252,8 +1659,32 @@ def persist_transition(
 
                 return
 
-            # ONLY after Supabase succeeded
-            # publish the new state.
+            # ------------------------------------------------
+            # Verify อีกครั้ง
+            # ------------------------------------------------
+
+            verified, verify_error = (
+                verify_database_state(
+                    place_id,
+                    new_state,
+                )
+            )
+
+            if not verified:
+
+                LOG.error(
+                    "Transition verification failed "
+                    "for %s: %s",
+                    place_id,
+                    verify_error,
+                )
+
+                return
+
+            # ------------------------------------------------
+            # DB OK -> RAM
+            # ------------------------------------------------
+
             with LOCK:
 
                 current_after = DATA[
@@ -1282,6 +1713,7 @@ def persist_transition(
     finally:
 
         with LOCK:
+
             TRANSITION_PENDING.discard(
                 place_id
             )
@@ -1291,6 +1723,7 @@ def request_transition_if_needed(
     place_id,
     state,
 ):
+
     if (
         state["mode"]
         != "scheduled"
@@ -1335,9 +1768,11 @@ def request_transition_if_needed(
 # ============================================================
 
 def snapshot(place_id):
+
     ensure_db_loaded()
 
     if place_id not in PLACE_IDS:
+
         raise ValueError(
             "unknown place"
         )
@@ -1347,10 +1782,6 @@ def snapshot(place_id):
         base_state = copy.deepcopy(
             DATA["places"][place_id]
         )
-
-    # --------------------------------------------------------
-    # Do NOT mutate DATA here.
-    # --------------------------------------------------------
 
     view_state = build_expired_state(
         base_state
@@ -1501,9 +1932,14 @@ def make_new_state(
     reason=None,
     seconds=None,
 ):
+
     new_state = copy.deepcopy(
         current
     )
+
+    # --------------------------------------------------------
+    # Reason
+    # --------------------------------------------------------
 
     if reason is not None:
 
@@ -1513,6 +1949,10 @@ def make_new_state(
             )
         )
 
+    # --------------------------------------------------------
+    # Seconds
+    # --------------------------------------------------------
+
     if seconds is not None:
 
         new_state["seconds"] = (
@@ -1521,6 +1961,10 @@ def make_new_state(
             )
         )
 
+    # --------------------------------------------------------
+    # Mode
+    # --------------------------------------------------------
+
     if mode is not None:
 
         if mode not in {
@@ -1528,6 +1972,7 @@ def make_new_state(
             "scheduled",
             "closed",
         }:
+
             raise ValueError(
                 "สถานะไม่ถูกต้อง"
             )
@@ -1535,6 +1980,10 @@ def make_new_state(
         now = time.time()
 
         new_state["mode"] = mode
+
+        # ----------------------------------------------------
+        # Scheduled
+        # ----------------------------------------------------
 
         if mode == "scheduled":
 
@@ -1558,6 +2007,10 @@ def make_new_state(
                 now + duration
             )
 
+        # ----------------------------------------------------
+        # Closed
+        # ----------------------------------------------------
+
         elif mode == "closed":
 
             new_state["deadline"] = now
@@ -1570,6 +2023,10 @@ def make_new_state(
                 )
                 or now
             )
+
+        # ----------------------------------------------------
+        # Open
+        # ----------------------------------------------------
 
         elif mode == "open":
 
@@ -1594,6 +2051,7 @@ def update_state(
     reason=None,
     seconds=None,
 ):
+
     if place_id not in PLACE_IDS:
 
         raise ValueError(
@@ -1616,12 +2074,10 @@ def update_state(
         )
 
         # ----------------------------------------------------
-        # IMPORTANT:
-        # Save FIRST.
-        # DATA remains untouched.
+        # DB FIRST
         # ----------------------------------------------------
 
-        ok, error = save_with_retry(
+        ok, error, _ = save_with_retry(
             place_id,
             new_state,
         )
@@ -1634,8 +2090,26 @@ def update_state(
             )
 
         # ----------------------------------------------------
-        # Supabase succeeded.
-        # Now update RAM.
+        # Read-after-write verification
+        # ----------------------------------------------------
+
+        verified, verify_error = (
+            verify_database_state(
+                place_id,
+                new_state,
+            )
+        )
+
+        if not verified:
+
+            raise RuntimeError(
+                "บันทึกแล้ว แต่ตรวจสอบข้อมูลใน "
+                "Supabase ไม่ผ่าน: "
+                + str(verify_error)
+            )
+
+        # ----------------------------------------------------
+        # DB + verification OK
         # ----------------------------------------------------
 
         with LOCK:
@@ -1647,7 +2121,7 @@ def update_state(
             )
 
         # ----------------------------------------------------
-        # Backup after DB success
+        # Backup
         # ----------------------------------------------------
 
         save_local_backup()
@@ -1666,6 +2140,7 @@ def update_all(
     reason=None,
     seconds=None,
 ):
+
     if mode not in {
         "open",
         "scheduled",
@@ -1733,17 +2208,16 @@ def update_all(
 
 
 # ============================================================
-# Login HTML
+# LOGIN HTML
 # ============================================================
 
 LOGIN_HTML = r"""
-<!doctype html>
-
+<!DOCTYPE html>
 <html lang="th">
 
 <head>
 
-<meta charset="utf-8">
+<meta charset="UTF-8">
 
 <meta
     name="viewport"
@@ -1754,129 +2228,119 @@ LOGIN_HTML = r"""
 
 <style>
 
-*{
-    box-sizing:border-box;
+* {
+    box-sizing: border-box;
 }
 
-body{
-    margin:0;
-    min-height:100vh;
-    display:grid;
-    place-items:center;
-    padding:20px;
-    color:#eef2ff;
+body {
+    margin: 0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
     background:
         radial-gradient(
-            circle at 20% 10%,
-            rgba(99,102,241,.20),
-            transparent 30%
-        ),
-        radial-gradient(
-            circle at 80% 90%,
-            rgba(14,165,233,.14),
-            transparent 30%
-        ),
-        #070a12;
+            circle at top,
+            #252525,
+            #090909 65%
+        );
+
+    color: white;
     font-family:
-        Inter,
-        Segoe UI,
         Arial,
+        "Noto Sans Thai",
         sans-serif;
 }
 
-.card{
-    width:min(430px,100%);
-    padding:32px;
-    border:1px solid #252b3d;
-    border-radius:24px;
-    background:rgba(15,19,31,.94);
+.login-card {
+
+    width: min(420px, calc(100% - 30px));
+
+    padding: 35px;
+
+    background: rgba(20,20,20,.95);
+
+    border: 1px solid #333;
+
+    border-radius: 22px;
+
     box-shadow:
-        0 24px 80px rgba(0,0,0,.45);
+        0 25px 80px rgba(0,0,0,.55);
 }
 
-.logo{
-    width:58px;
-    height:58px;
-    display:grid;
-    place-items:center;
-    border-radius:17px;
-    background:
-        linear-gradient(
-            135deg,
-            #6366f1,
-            #06b6d4
-        );
-    font-size:27px;
-    margin-bottom:20px;
+.logo {
+
+    font-size: 28px;
+    font-weight: 800;
+
+    margin-bottom: 8px;
 }
 
-h1{
-    margin:0 0 8px;
-    font-size:25px;
+.subtitle {
+
+    color: #999;
+
+    margin-bottom: 28px;
 }
 
-p{
-    color:#8e99ad;
-    margin:0 0 24px;
+input {
+
+    width: 100%;
+
+    padding: 15px;
+
+    border-radius: 12px;
+
+    border: 1px solid #444;
+
+    background: #111;
+
+    color: white;
+
+    outline: none;
+
+    font-size: 15px;
 }
 
-label{
-    display:block;
-    font-size:13px;
-    color:#aeb8ca;
-    margin-bottom:8px;
+input:focus {
+
+    border-color: #777;
+
 }
 
-input{
-    width:100%;
-    height:48px;
-    padding:0 14px;
-    color:#fff;
-    background:#0b0f19;
-    border:1px solid #293147;
-    border-radius:12px;
-    outline:none;
+button {
+
+    width: 100%;
+
+    margin-top: 14px;
+
+    padding: 14px;
+
+    border: 0;
+
+    border-radius: 12px;
+
+    cursor: pointer;
+
+    font-weight: 700;
+
+    background: white;
+
+    color: black;
 }
 
-input:focus{
-    border-color:#6366f1;
-    box-shadow:
-        0 0 0 3px
-        rgba(99,102,241,.15);
-}
+.error {
 
-button{
-    width:100%;
-    height:48px;
-    margin-top:14px;
-    border:0;
-    border-radius:12px;
-    color:#fff;
-    font-weight:700;
-    cursor:pointer;
-    background:
-        linear-gradient(
-            135deg,
-            #6366f1,
-            #4f46e5
-        );
-}
+    margin-top: 15px;
 
-.error{
-    padding:11px 13px;
-    margin-bottom:15px;
-    border-radius:10px;
-    background:#3a1218;
-    color:#ffb4be;
-    border:1px solid #69202c;
-    font-size:13px;
-}
+    padding: 12px;
 
-.small{
-    margin-top:18px;
-    text-align:center;
-    font-size:12px;
-    color:#657086;
+    border-radius: 10px;
+
+    background: rgba(255,50,50,.12);
+
+    color: #ff7373;
 }
 
 </style>
@@ -1885,591 +2349,520 @@ button{
 
 <body>
 
-<div class="card">
+<div class="login-card">
 
-<div class="logo">
-🛡️
-</div>
+    <div class="logo">
+        🎮 Roblox Control Center
+    </div>
 
-<h1>
-Roblox Control Center
-</h1>
+    <div class="subtitle">
+        ระบบควบคุมสถานะเซิร์ฟเวอร์
+    </div>
 
-<p>
-เข้าสู่ระบบผู้ดูแลระบบ
-</p>
+    <form method="POST">
 
-{% if error %}
+        <input
+            type="password"
+            name="password"
+            autocomplete="current-password"
+            placeholder="กรอกรหัสผ่าน"
+            required
+            autofocus
+        >
 
-<div class="error">
-{{ error }}
-</div>
+        <button type="submit">
+            🔐 เข้าสู่ระบบ
+        </button>
 
-{% endif %}
+    </form>
 
-<form method="post">
+    {% if error %}
 
-<label>
-Admin Password
-</label>
+        <div class="error">
+            {{ error }}
+        </div>
 
-<input
-    type="password"
-    name="password"
-    autocomplete="current-password"
-    placeholder="กรอกรหัสผ่าน"
-    required
-    autofocus
->
-
-<button type="submit">
-เข้าสู่ระบบ →
-</button>
-
-</form>
-
-<div class="small">
-Secure administrator dashboard
-</div>
+    {% endif %}
 
 </div>
 
 </body>
-
 </html>
 """
 
 
 # ============================================================
-# Dashboard HTML
+# DASHBOARD HTML
 # ============================================================
 
 DASHBOARD_HTML = r"""
-<!doctype html>
+<!DOCTYPE html>
 
 <html lang="th">
 
 <head>
 
-<meta charset="utf-8">
+<meta charset="UTF-8">
 
 <meta
     name="viewport"
     content="width=device-width,initial-scale=1"
 >
 
-<title>
-Roblox Control Center
-</title>
+<title>Roblox Control Center</title>
 
 <style>
 
-:root{
-    --bg:#070a12;
-    --panel:#0f1420;
-    --border:#242c3e;
-    --text:#eef2ff;
-    --muted:#8994a8;
-    --blue:#6366f1;
-    --cyan:#06b6d4;
-    --green:#22c55e;
-    --yellow:#f59e0b;
-    --red:#ef4444;
+* {
+    box-sizing: border-box;
 }
 
-*{
-    box-sizing:border-box;
+:root {
+    --bg: #080808;
+    --card: #111;
+    --card2: #171717;
+    --border: #292929;
+    --text: #f5f5f5;
+    --muted: #8d8d8d;
+    --green: #39d98a;
+    --red: #ff5d5d;
+    --blue: #5da9ff;
+    --yellow: #ffc857;
 }
 
-body{
-    margin:0;
-    color:var(--text);
+body {
+
+    margin: 0;
+
+    min-height: 100vh;
+
     background:
         radial-gradient(
-            circle at 10% 0%,
-            rgba(99,102,241,.13),
-            transparent 28%
+            circle at 20% 0%,
+            #222,
+            transparent 35%
         ),
         radial-gradient(
-            circle at 100% 100%,
-            rgba(6,182,212,.08),
+            circle at 90% 10%,
+            #171717,
             transparent 30%
         ),
         var(--bg);
+
+    color: var(--text);
+
     font-family:
-        Inter,
-        Segoe UI,
         Arial,
+        "Noto Sans Thai",
         sans-serif;
 }
 
-button,
-input,
-select{
-    font:inherit;
+.container {
+
+    width: min(1100px, calc(100% - 28px));
+
+    margin: auto;
+
+    padding: 25px 0 50px;
 }
 
-.app{
-    width:min(1200px,100%);
-    margin:auto;
-    padding:22px;
+.header {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+
+    gap: 15px;
+
+    margin-bottom: 22px;
 }
 
-.header{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:15px;
-    padding:20px 22px;
-    margin-bottom:18px;
-    border:1px solid var(--border);
-    border-radius:20px;
-    background:rgba(15,20,32,.88);
-    box-shadow:
-        0 20px 60px rgba(0,0,0,.22);
+.title {
+
+    font-size: clamp(24px, 4vw, 38px);
+
+    font-weight: 900;
 }
 
-.brand{
-    display:flex;
-    align-items:center;
-    gap:13px;
+.subtitle {
+
+    color: var(--muted);
+
+    margin-top: 5px;
 }
 
-.logo{
-    width:48px;
-    height:48px;
-    border-radius:15px;
-    display:grid;
-    place-items:center;
-    font-size:23px;
+.logout {
+
+    color: #aaa;
+
+    text-decoration: none;
+
+    padding: 10px 14px;
+
+    border: 1px solid var(--border);
+
+    border-radius: 10px;
+}
+
+.statusbar {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(3, 1fr);
+
+    gap: 12px;
+
+    margin-bottom: 15px;
+}
+
+.status {
+
+    background: var(--card);
+
+    border: 1px solid var(--border);
+
+    border-radius: 14px;
+
+    padding: 14px;
+}
+
+.status-label {
+
+    color: var(--muted);
+
+    font-size: 12px;
+
+    margin-bottom: 6px;
+}
+
+.status-value {
+
+    font-weight: 800;
+}
+
+.card {
+
     background:
         linear-gradient(
-            135deg,
-            var(--blue),
-            var(--cyan)
-        );
-}
+            180deg,
+            rgba(255,255,255,.035),
+            rgba(255,255,255,.015)
+        ),
+        var(--card);
 
-h1{
-    font-size:19px;
-    margin:0;
-}
+    border: 1px solid var(--border);
 
-.sub{
-    font-size:12px;
-    color:var(--muted);
-    margin-top:3px;
-}
+    border-radius: 18px;
 
-.header-right{
-    display:flex;
-    align-items:center;
-    gap:9px;
-}
+    padding: 20px;
 
-.logout{
-    text-decoration:none;
-    color:#ffc1c1;
-    border:1px solid #51222a;
-    background:#211016;
-    padding:9px 13px;
-    border-radius:10px;
-    font-size:12px;
-}
+    margin-bottom: 15px;
 
-.grid{
-    display:grid;
-    grid-template-columns:1.05fr .95fr;
-    gap:18px;
-}
-
-.panel{
-    background:rgba(15,20,32,.90);
-    border:1px solid var(--border);
-    border-radius:20px;
-    padding:20px;
-}
-
-.panel h2{
-    font-size:15px;
-    margin:0 0 17px;
-}
-
-.field{
-    margin-bottom:15px;
-}
-
-label{
-    display:block;
-    margin-bottom:7px;
-    color:#aab4c7;
-    font-size:12px;
-    font-weight:700;
-}
-
-input[type=text],
-input[type=number],
-input[type=password],
-select{
-    width:100%;
-    height:44px;
-    padding:0 12px;
-    color:#f8fafc;
-    background:#090d16;
-    border:1px solid #273047;
-    border-radius:10px;
-    outline:none;
-}
-
-input:focus,
-select:focus{
-    border-color:var(--blue);
     box-shadow:
-        0 0 0 3px
-        rgba(99,102,241,.12);
+        0 15px 50px rgba(0,0,0,.2);
 }
 
-.row{
-    display:grid;
-    grid-template-columns:1fr 220px;
-    gap:12px;
+.section-title {
+
+    font-size: 18px;
+
+    font-weight: 800;
+
+    margin-bottom: 15px;
 }
 
-.check{
-    display:flex;
-    align-items:center;
-    gap:9px;
-    padding:11px 12px;
-    border:1px solid var(--border);
-    border-radius:10px;
-    background:#0b1019;
-    height:44px;
+label {
+
+    display: block;
+
+    color: #bbb;
+
+    font-size: 13px;
+
+    margin-bottom: 7px;
 }
 
-.check input{
-    width:17px;
-    height:17px;
+select,
+input[type="text"],
+input[type="number"],
+input[type="password"] {
+
+    width: 100%;
+
+    padding: 13px 14px;
+
+    background: #0c0c0c;
+
+    border: 1px solid #333;
+
+    color: white;
+
+    border-radius: 11px;
+
+    outline: none;
+
+    font-size: 15px;
 }
 
-.check label{
-    margin:0;
-    color:#dce3f1;
+select:focus,
+input:focus {
+
+    border-color: #777;
 }
 
-.buttons{
-    display:grid;
-    grid-template-columns:repeat(3,1fr);
-    gap:9px;
+.field {
+
+    margin-bottom: 15px;
 }
 
-.btn{
-    min-height:44px;
-    padding:10px 12px;
-    border:0;
-    border-radius:10px;
-    color:#fff;
-    font-weight:750;
-    cursor:pointer;
-    transition:.15s;
+.grid {
+
+    display: grid;
+
+    grid-template-columns:
+        1fr 1fr;
+
+    gap: 14px;
 }
 
-.btn:hover{
-    transform:translateY(-1px);
-    filter:brightness(1.08);
+button {
+
+    border: 0;
+
+    cursor: pointer;
+
+    border-radius: 11px;
+
+    padding: 13px 15px;
+
+    font-weight: 800;
+
+    transition:
+        transform .1s,
+        opacity .1s;
 }
 
-.btn:disabled{
-    opacity:.5;
-    cursor:not-allowed;
-    transform:none;
+button:active {
+
+    transform: scale(.98);
 }
 
-.close{
-    background:#b91c1c;
+button:disabled {
+
+    opacity: .5;
+
+    cursor: not-allowed;
 }
 
-.cancel{
-    background:#b45309;
+.btn-row {
+
+    display: grid;
+
+    grid-template-columns:
+        repeat(2, 1fr);
+
+    gap: 10px;
+
+    margin-top: 10px;
 }
 
-.open{
-    background:#15803d;
+.btn {
+
+    color: white;
+
+    background: #272727;
 }
 
-.blue{
-    background:#4338ca;
+.btn.open {
+
+    background: #155b39;
 }
 
-.gray{
-    background:#1f2937;
+.btn.close {
+
+    background: #722828;
 }
 
-.all{
-    grid-column:1/-1;
+.btn.cancel {
+
+    background: #333;
 }
 
-.status{
-    position:relative;
-    overflow:hidden;
-    border:1px solid var(--border);
-    border-radius:16px;
-    padding:17px;
-    background:#090e18;
-    margin-bottom:12px;
+.btn.blue {
+
+    background: #194d7d;
 }
 
-.status::before{
-    content:"";
-    position:absolute;
-    left:0;
-    top:0;
-    bottom:0;
-    width:4px;
-    background:var(--green);
+.btn.gray {
+
+    background: #242424;
 }
 
-.status.scheduled::before{
-    background:var(--yellow);
+.all {
+
+    width: 100%;
 }
 
-.status.closed::before{
-    background:var(--red);
+.state-box {
+
+    background: #0b0b0b;
+
+    border: 1px solid #292929;
+
+    border-radius: 14px;
+
+    padding: 17px;
+
+    margin-top: 16px;
 }
 
-.status-head{
-    display:flex;
-    justify-content:space-between;
-    align-items:center;
-    gap:10px;
+.state-main {
+
+    display: flex;
+
+    justify-content: space-between;
+
+    align-items: center;
+
+    gap: 15px;
 }
 
-.badge{
-    display:inline-flex;
-    align-items:center;
-    gap:6px;
-    padding:5px 8px;
-    border-radius:999px;
-    font-size:11px;
-    font-weight:800;
-    background:#102719;
-    color:#86efac;
+.badge {
+
+    display: inline-flex;
+
+    align-items: center;
+
+    gap: 7px;
+
+    padding: 7px 11px;
+
+    border-radius: 999px;
+
+    font-size: 12px;
+
+    font-weight: 800;
+
+    background: #222;
+
 }
 
-.badge.scheduled{
-    background:#2b210c;
-    color:#fcd34d;
+.badge.online {
+
+    color: var(--green);
+
+    background: rgba(57,217,138,.1);
 }
 
-.badge.closed{
-    background:#2a1115;
-    color:#fca5a5;
+.badge.offline {
+
+    color: var(--red);
+
+    background: rgba(255,93,93,.1);
 }
 
-.big{
-    margin:12px 0 3px;
-    font-size:14px;
-    color:#93a4bd;
+.badge.warn {
+
+    color: var(--yellow);
+
+    background: rgba(255,200,87,.1);
 }
 
-.timer{
-    font-variant-numeric:tabular-nums;
-    font-size:34px;
-    font-weight:900;
-    letter-spacing:1px;
+.reason-preview {
+
+    color: #bbb;
+
+    margin-top: 10px;
+
+    word-break: break-word;
 }
 
-.progress{
-    height:7px;
-    background:#1c2535;
-    border-radius:99px;
-    overflow:hidden;
-    margin:12px 0;
+.timer {
+
+    font-size: 32px;
+
+    font-weight: 900;
+
+    margin-top: 10px;
 }
 
-.progress > div{
-    height:100%;
-    width:0;
-    background:
-        linear-gradient(
-            90deg,
-            var(--blue),
-            var(--cyan)
-        );
+.save-status {
+
+    min-height: 22px;
+
+    margin-top: 12px;
+
+    font-size: 13px;
+
 }
 
-.details{
-    display:grid;
-    grid-template-columns:1fr 1fr;
-    gap:8px;
-    margin-top:13px;
+.save-status.success {
+
+    color: var(--green);
 }
 
-.detail{
-    padding:9px 10px;
-    border-radius:9px;
-    background:#0d1320;
-    border:1px solid #1d2638;
+.save-status.error {
+
+    color: var(--red);
 }
 
-.detail b{
-    display:block;
-    color:#68758b;
-    font-size:10px;
-    margin-bottom:3px;
+.save-status.info {
+
+    color: var(--blue);
 }
 
-.detail span{
-    font-size:12px;
-    color:#dbe3f0;
-    word-break:break-word;
+.token-box {
+
+    display: none;
+
+    margin-top: 12px;
+
+    padding: 12px;
+
+    border-radius: 10px;
+
+    background: #080808;
+
+    border: 1px solid #333;
+
+    word-break: break-all;
+
+    font-family: monospace;
+
+    color: #ddd;
 }
 
-.reason{
-    margin-top:10px;
-    padding:10px;
-    border-radius:9px;
-    background:#0d1320;
-    color:#bac5d7;
-    font-size:12px;
+.small {
+
+    color: #777;
+
+    font-size: 12px;
+
+    margin-top: 8px;
 }
 
-.token{
-    margin-top:18px;
-    padding:15px;
-    border:1px solid var(--border);
-    border-radius:15px;
-    background:#090e18;
+.dirty {
+
+    border-color: var(--yellow) !important;
+
 }
 
-.token-value{
-    margin-top:8px;
-    padding:10px;
-    background:#060912;
-    border-radius:9px;
-    color:#67e8f9;
-    font-family:
-        ui-monospace,
-        Consolas,
-        monospace;
-    font-size:12px;
-    word-break:break-all;
-    min-height:39px;
-}
+@media (max-width: 700px) {
 
-.token-actions{
-    display:grid;
-    grid-template-columns:1fr auto auto;
-    gap:8px;
-    margin-top:9px;
-}
+    .statusbar,
+    .grid,
+    .btn-row {
 
-.token-actions .btn{
-    margin:0;
-}
-
-.system-box{
-    display:grid;
-    grid-template-columns:1fr 1fr;
-    gap:8px;
-    margin-bottom:14px;
-}
-
-.system{
-    padding:10px;
-    border:1px solid #1d2638;
-    border-radius:10px;
-    background:#0b1019;
-}
-
-.system-title{
-    font-size:10px;
-    color:#68758b;
-    margin-bottom:4px;
-}
-
-.system-value{
-    font-size:12px;
-    font-weight:800;
-}
-
-.ok{
-    color:#86efac;
-}
-
-.off{
-    color:#fca5a5;
-}
-
-.notice{
-    position:fixed;
-    right:18px;
-    bottom:18px;
-    max-width:420px;
-    padding:13px 15px;
-    border:1px solid #2b3850;
-    border-radius:12px;
-    background:#111827;
-    color:#e5e7eb;
-    box-shadow:
-        0 15px 50px rgba(0,0,0,.4);
-    display:none;
-    z-index:100;
-}
-
-.notice.show{
-    display:block;
-}
-
-.notice.ok{
-    border-color:#185b35;
-}
-
-.notice.bad{
-    border-color:#6b2630;
-}
-
-@media(max-width:850px){
-
-    .grid{
-        grid-template-columns:1fr;
+        grid-template-columns: 1fr;
     }
 
-}
+    .header {
 
-@media(max-width:600px){
+        align-items: flex-start;
 
-    .app{
-        padding:12px;
-    }
-
-    .header{
-        padding:15px;
-        align-items:flex-start;
-    }
-
-    .header-right{
-        flex-direction:column;
-        align-items:flex-end;
-    }
-
-    .buttons{
-        grid-template-columns:1fr;
-    }
-
-    .row{
-        grid-template-columns:1fr;
-    }
-
-    .details{
-        grid-template-columns:1fr;
-    }
-
-    .token-actions{
-        grid-template-columns:1fr;
-    }
-
-    .system-box{
-        grid-template-columns:1fr;
     }
 
 }
@@ -2480,1863 +2873,1358 @@ select:focus{
 
 <body>
 
-<div class="app">
+<div class="container">
 
-<header class="header">
+    <div class="header">
 
-<div class="brand">
+        <div>
 
-<div class="logo">
-🛡️
+            <div class="title">
+                🎮 Roblox Control Center
+            </div>
+
+            <div class="subtitle">
+                Stable Control Dashboard
+            </div>
+
+        </div>
+
+        <a
+            class="logout"
+            href="/logout"
+        >
+            ออกจากระบบ
+        </a>
+
+    </div>
+
+
+    <!-- SYSTEM STATUS -->
+
+    <div class="statusbar">
+
+        <div class="status">
+
+            <div class="status-label">
+                DATABASE
+            </div>
+
+            <div
+                id="dbStatus"
+                class="status-value"
+            >
+                กำลังตรวจสอบ...
+            </div>
+
+        </div>
+
+        <div class="status">
+
+            <div class="status-label">
+                BACKUP
+            </div>
+
+            <div
+                id="backupStatus"
+                class="status-value"
+            >
+                กำลังตรวจสอบ...
+            </div>
+
+        </div>
+
+        <div class="status">
+
+            <div class="status-label">
+                CURRENT MAP
+            </div>
+
+            <div
+                id="currentStatus"
+                class="status-value"
+            >
+                -
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- CONTROL -->
+
+    <div class="card">
+
+        <div class="section-title">
+            ⚙️ ควบคุมเซิร์ฟเวอร์
+        </div>
+
+
+        <div class="field">
+
+            <label>
+                เลือกแมพ
+            </label>
+
+            <select
+                id="mapSelect"
+                onchange="loadSelected()"
+            >
+
+                {% for name, pid in maps.items() %}
+
+                <option value="{{ pid }}">
+                    {{ name }} — {{ pid }}
+                </option>
+
+                {% endfor %}
+
+            </select>
+
+        </div>
+
+
+        <div class="field">
+
+            <label>
+                เหตุผล / ข้อความแจ้งเตือน
+            </label>
+
+            <input
+                id="reasonInput"
+                type="text"
+                maxlength="500"
+                value="{{ default_reason }}"
+                autocomplete="off"
+            >
+
+            <div class="small">
+                สูงสุด 500 ตัวอักษร
+            </div>
+
+        </div>
+
+
+        <div class="grid">
+
+            <div class="field">
+
+                <label>
+                    Countdown (วินาที)
+                </label>
+
+                <input
+                    id="secondsInput"
+                    type="number"
+                    min="1"
+                    max="86400"
+                    value="60"
+                >
+
+            </div>
+
+
+            <div class="field">
+
+                <label>
+                    โหมด Countdown
+                </label>
+
+                <div
+                    style="
+                        padding:13px 0;
+                    "
+                >
+
+                    <input
+                        id="timerEnabled"
+                        type="checkbox"
+                        checked
+                        style="
+                            width:auto;
+                        "
+                    >
+
+                    เปิดใช้งาน Countdown
+
+                </div>
+
+            </div>
+
+        </div>
+
+
+        <!-- STATUS ACTIONS -->
+
+        <div class="btn-row">
+
+            <button
+                class="btn close"
+                onclick="actionSelected('scheduled')"
+            >
+                🛑 เริ่มปิด
+            </button>
+
+            <button
+                class="btn cancel"
+                onclick="actionSelected('open')"
+            >
+                ↩ ยกเลิก / เปิด
+            </button>
+
+            <button
+                class="btn open"
+                onclick="actionSelected('open')"
+            >
+                🟢 เปิดแมพ
+            </button>
+
+            <button
+                class="btn close"
+                onclick="actionSelected('closed')"
+            >
+                🚨 ปิดทันที
+            </button>
+
+        </div>
+
+
+        <!-- SAVE CONFIG -->
+
+        <button
+            id="saveConfigButton"
+            class="btn blue"
+            style="
+                width:100%;
+                margin-top:12px;
+            "
+            onclick="saveConfig()"
+        >
+            💾 บันทึกข้อความ + เวลา
+        </button>
+
+
+        <div
+            id="saveStatus"
+            class="save-status"
+        ></div>
+
+
+        <!-- STATE -->
+
+        <div class="state-box">
+
+            <div class="state-main">
+
+                <strong>
+                    สถานะปัจจุบัน
+                </strong>
+
+                <span
+                    id="stateBadge"
+                    class="badge"
+                >
+                    -
+                </span>
+
+            </div>
+
+            <div
+                id="reasonPreview"
+                class="reason-preview"
+            >
+                -
+            </div>
+
+            <div
+                id="timerDisplay"
+                class="timer"
+            >
+                -
+            </div>
+
+        </div>
+
+    </div>
+
+
+    <!-- ALL MAPS -->
+
+    <div class="card">
+
+        <div class="section-title">
+            🌐 ควบคุมทุกแมพ
+        </div>
+
+        <div class="btn-row">
+
+            <button
+                class="btn close"
+                onclick="actionAll('closed')"
+            >
+                🚨 ปิดทุกแมพทันที
+            </button>
+
+            <button
+                class="btn cancel"
+                onclick="actionAll('open')"
+            >
+                ↩️ เปิด / ยกเลิกทุกแมพ
+            </button>
+
+            <button
+                class="btn blue"
+                onclick="actionAll('scheduled')"
+            >
+                ⏳ Countdown ทุกแมพ
+            </button>
+
+        </div>
+
+    </div>
+
+
+    <!-- TOKEN -->
+
+    <div class="card">
+
+        <div class="section-title">
+            🔐 System Token
+        </div>
+
+        <div class="field">
+
+            <label>
+                Token PIN
+            </label>
+
+            <input
+                id="pinInput"
+                type="password"
+                placeholder="กรอก Token PIN"
+                autocomplete="off"
+            >
+
+        </div>
+
+        <div class="btn-row">
+
+            <button
+                id="revealButton"
+                class="btn blue"
+                onclick="revealToken()"
+            >
+                👁️ ดู Token
+            </button>
+
+            <button
+                id="newTokenButton"
+                class="btn close"
+                onclick="newToken()"
+            >
+                🔄 สร้าง Token ใหม่
+            </button>
+
+        </div>
+
+        <div
+            id="tokenBox"
+            class="token-box"
+        ></div>
+
+    </div>
+
 </div>
-
-<div>
-
-<h1>
-Roblox Control Center
-</h1>
-
-<div class="sub">
-ระบบควบคุมสถานะ Roblox แบบ Real-time
-</div>
-
-</div>
-
-</div>
-
-<div class="header-right">
-
-<span
-    id="dbBadge"
-    class="badge"
->
-● กำลังตรวจสอบ
-</span>
-
-<a
-    class="logout"
-    href="/logout"
->
-ออกจากระบบ
-</a>
-
-</div>
-
-</header>
-
-
-<div class="grid">
-
-
-<section class="panel">
-
-<h2>
-⚙️ การควบคุม
-</h2>
-
-
-<div class="field">
-
-<label>
-เลือกแมพ
-</label>
-
-<select
-    id="mapSelect"
-    onchange="loadSelected()"
->
-
-<option value="ALL">
-🌐 จัดการทุกแมพ
-</option>
-
-{% for name, pid in maps.items() %}
-
-<option value="{{ pid }}">
-{{ name }} · {{ pid }}
-</option>
-
-{% endfor %}
-
-</select>
-
-</div>
-
-
-<div class="field">
-
-<label>
-เหตุผล / ข้อความแจ้งเตือน
-</label>
-
-<input
-    id="reasonInput"
-    type="text"
-    maxlength="500"
-    value="{{ default_reason }}"
->
-
-</div>
-
-
-<div class="row">
-
-<div class="field">
-
-<label>
-เวลา Countdown (วินาที)
-</label>
-
-<input
-    id="secondsInput"
-    type="number"
-    min="1"
-    max="86400"
-    value="60"
->
-
-</div>
-
-
-<div class="field">
-
-<label>
-Timer
-</label>
-
-<div class="check">
-
-<input
-    id="timerEnabled"
-    type="checkbox"
-    checked
->
-
-<label for="timerEnabled">
-นับถอยหลังก่อนปิด
-</label>
-
-</div>
-
-</div>
-
-</div>
-
-
-<div class="buttons">
-
-<button
-    class="btn close"
-    onclick="actionSelected('scheduled')"
->
-🛑 เริ่มปิด
-</button>
-
-<button
-    class="btn cancel"
-    onclick="actionSelected('open')"
->
-↩ ยกเลิก / เปิด
-</button>
-
-<button
-    class="btn open"
-    onclick="actionSelected('open')"
->
-🟢 เปิดแมพ
-</button>
-
-<button
-    class="btn close all"
-    onclick="actionAll('closed')"
->
-🚨 ปิดทุกแมพทันที
-</button>
-
-<button
-    class="btn cancel all"
-    onclick="actionAll('open')"
->
-↩️ เปิด / ยกเลิกทุกแมพ
-</button>
-
-<button
-    class="btn blue all"
-    onclick="actionAll('scheduled')"
->
-⏳ Countdown ทุกแมพ
-</button>
-
-</div>
-
-
-<div style="margin-top:10px">
-
-<button
-    class="btn gray"
-    style="width:100%"
-    onclick="saveConfig()"
->
-💾 บันทึกข้อความ + เวลา โดยไม่เปลี่ยนสถานะ
-</button>
-
-</div>
-
-</section>
-
-
-<section class="panel">
-
-<h2>
-📡 สถานะระบบ
-</h2>
-
-
-<div class="system-box">
-
-<div class="system">
-
-<div class="system-title">
-SUPABASE
-</div>
-
-<div
-    id="supabaseStatus"
-    class="system-value"
->
-กำลังตรวจสอบ...
-</div>
-
-</div>
-
-
-<div class="system">
-
-<div class="system-title">
-LOCAL BACKUP
-</div>
-
-<div
-    id="backupStatus"
-    class="system-value"
->
-กำลังตรวจสอบ...
-</div>
-
-</div>
-
-</div>
-
-
-<div id="statusList">
-
-<div class="status">
-กำลังโหลด...
-</div>
-
-</div>
-
-
-<div class="token">
-
-<div
-    style="
-        font-weight:800;
-        font-size:13px;
-    "
->
-🔑 Roblox API Token
-</div>
-
-<div
-    class="sub"
-    style="margin-top:4px"
->
-Token จริงจะไม่ถูกฝังใน HTML หรือ JavaScript
-จะส่งกลับจาก Server เฉพาะหลังยืนยัน PIN
-</div>
-
-<div
-    id="tokenDisplay"
-    class="token-value"
->
-••••••••••••••••••••••••••••••••
-</div>
-
-<div class="token-actions">
-
-<input
-    id="pinInput"
-    type="password"
-    placeholder="Token PIN"
-    autocomplete="off"
->
-
-<button
-    id="revealButton"
-    class="btn blue"
-    onclick="revealToken()"
->
-👁️ ดู Token
-</button>
-
-<button
-    id="newTokenButton"
-    class="btn close"
-    onclick="newToken()"
->
-🔄 สร้างใหม่
-</button>
-
-</div>
-
-</div>
-
-</section>
-
-</div>
-
-</div>
-
-
-<div
-    id="notice"
-    class="notice"
-></div>
 
 
 <script>
 
+/* ==========================================================
+   Roblox Control Center Frontend
+   ========================================================== */
 
-// ========================================================
-// State
-// ========================================================
+const stateCache = {};
 
-let statesCache = [];
+let selectedPlaceId = null;
 
-let serverOffsetMs = 0;
+let refreshTimer = null;
 
-let busy = false;
+let inputDirty = false;
 
-let tokenVisible = false;
-
-
-// ========================================================
-// DOM
-// ========================================================
-
-const $ = id =>
-    document.getElementById(id);
+let isSaving = false;
 
 
-// ========================================================
-// Notification
-// ========================================================
+/* ==========================================================
+   DOM
+   ========================================================== */
 
-function notify(
-    message,
-    ok = true
-){
+const mapSelect =
+    document.getElementById("mapSelect");
 
-    const box = $(
-        "notice"
+const reasonInput =
+    document.getElementById("reasonInput");
+
+const secondsInput =
+    document.getElementById("secondsInput");
+
+const timerEnabled =
+    document.getElementById("timerEnabled");
+
+const saveStatus =
+    document.getElementById("saveStatus");
+
+const saveConfigButton =
+    document.getElementById(
+        "saveConfigButton"
     );
 
-    box.textContent =
+
+/* ==========================================================
+   Input Dirty Tracking
+   ========================================================== */
+
+function markDirty() {
+
+    inputDirty = true;
+
+    reasonInput.classList.add("dirty");
+
+    secondsInput.classList.add("dirty");
+}
+
+
+function clearDirty() {
+
+    inputDirty = false;
+
+    reasonInput.classList.remove("dirty");
+
+    secondsInput.classList.remove("dirty");
+}
+
+
+reasonInput.addEventListener(
+    "input",
+    markDirty
+);
+
+secondsInput.addEventListener(
+    "input",
+    markDirty
+);
+
+
+/* ==========================================================
+   Save Status
+   ========================================================== */
+
+function setSaveStatus(
+    message,
+    type = "info"
+) {
+
+    saveStatus.textContent =
         message;
 
-    box.className =
-        "notice show "
-        +
-        (
-            ok
-            ? "ok"
-            : "bad"
-        );
-
-    clearTimeout(
-        notify.timer
-    );
-
-    notify.timer =
-        setTimeout(
-            () => {
-
-                box.className =
-                    "notice";
-
-            },
-            4500
-        );
-
+    saveStatus.className =
+        "save-status " + type;
 }
 
 
-// ========================================================
-// Busy
-// ========================================================
-
-function setBusy(
-    value
-){
-
-    busy = value;
-
-    document
-        .querySelectorAll(
-            "button"
-        )
-        .forEach(
-            button => {
-
-                button.disabled =
-                    value;
-
-            }
-        );
-
-}
-
-
-// ========================================================
-// API
-// ========================================================
+/* ==========================================================
+   API
+   ========================================================== */
 
 async function api(
     url,
     options = {}
-){
+) {
 
-    const headers =
-        new Headers(
-            options.headers || {}
-        );
-
-    headers.set(
-        "Cache-Control",
-        "no-cache"
-    );
-
-    headers.set(
-        "Pragma",
-        "no-cache"
-    );
-
-    if(
-        options.body
-        &&
-        !headers.has(
-            "Content-Type"
-        )
-    ){
-
-        headers.set(
-            "Content-Type",
-            "application/json"
-        );
-
-    }
+    const finalOptions = {
+        cache: "no-store",
+        ...options,
+        headers: {
+            "Content-Type":
+                "application/json",
+            ...(options.headers || {})
+        }
+    };
 
     const response =
         await fetch(
-            url,
-            {
-                ...options,
-                headers,
-                cache:"no-store",
-                credentials:"same-origin"
-            }
+            url +
+                (
+                    url.includes("?")
+                        ? "&"
+                        : "?"
+                ) +
+                "_=" +
+                Date.now(),
+            finalOptions
         );
 
-    let data;
+    let data = null;
 
-    try{
+    try {
 
         data =
             await response.json();
 
-    }catch{
+    } catch {
 
-        data = {
-            ok:false,
-            error:
-                "Server returned invalid JSON"
-        };
+        throw new Error(
+            "Server ส่งข้อมูลไม่ถูกต้อง"
+        );
 
     }
 
-    if(
-        !response.ok
-        ||
-        data.ok === false
-    ){
+    if (!response.ok || !data.ok) {
 
         throw new Error(
-            data.error
-            ||
+            data.error ||
             `HTTP ${response.status}`
         );
 
     }
 
     return data;
-
 }
 
 
-// ========================================================
-// Duration
-// ========================================================
+/* ==========================================================
+   Format
+   ========================================================== */
 
-function fmtDuration(
-    totalSeconds
-){
+function formatSeconds(seconds) {
 
-    totalSeconds =
+    seconds =
         Math.max(
             0,
             Math.floor(
-                Number(
-                    totalSeconds
-                )
-                || 0
+                Number(seconds) || 0
             )
         );
-
-    const d =
-        Math.floor(
-            totalSeconds / 86400
-        );
-
-    totalSeconds %= 86400;
 
     const h =
         Math.floor(
-            totalSeconds / 3600
+            seconds / 3600
         );
-
-    totalSeconds %= 3600;
 
     const m =
         Math.floor(
-            totalSeconds / 60
+            (seconds % 3600) / 60
         );
 
     const s =
-        totalSeconds % 60;
+        seconds % 60;
 
-
-    if(d > 0){
+    if (h > 0) {
 
         return (
-            `${d}d `
-            +
-            `${String(h).padStart(2,"0")}:`
-            +
-            `${String(m).padStart(2,"0")}:`
-            +
-            `${String(s).padStart(2,"0")}`
+            String(h).padStart(2, "0")
+            + ":" +
+            String(m).padStart(2, "0")
+            + ":" +
+            String(s).padStart(2, "0")
         );
 
     }
 
-
     return (
-        `${String(h).padStart(2,"0")}:`
-        +
-        `${String(m).padStart(2,"0")}:`
-        +
-        `${String(s).padStart(2,"0")}`
+        String(m).padStart(2, "0")
+        + ":" +
+        String(s).padStart(2, "0")
     );
-
 }
 
 
-// ========================================================
-// Clock
-// ========================================================
-
-function fmtClock(
-    timestamp
-){
-
-    if(
-        timestamp === null
-        ||
-        timestamp === undefined
-        ||
-        timestamp === ""
-    ){
-
-        return "-";
-
-    }
-
-    const number =
-        Number(timestamp);
-
-    if(
-        !Number.isFinite(
-            number
-        )
-    ){
-
-        return "-";
-
-    }
-
-    return new Date(
-        number * 1000
-    ).toLocaleString(
-        "th-TH",
-        {
-            year:"numeric",
-            month:"2-digit",
-            day:"2-digit",
-            hour:"2-digit",
-            minute:"2-digit",
-            second:"2-digit"
-        }
-    );
-
-}
-
-
-// ========================================================
-// Server Time
-// ========================================================
-
-function currentServerTime(){
-
-    return (
-        Date.now()
-        +
-        serverOffsetMs
-    ) / 1000;
-
-}
-
-
-// ========================================================
-// Escape HTML
-// ========================================================
-
-function escapeHtml(
-    value
-){
-
-    return String(
-        value ?? ""
-    ).replace(
-        /[&<>"']/g,
-        character => ({
-            "&":"&amp;",
-            "<":"&lt;",
-            ">":"&gt;",
-            '"':"&quot;",
-            "'":"&#039;"
-        }[character])
-    );
-
-}
-
-
-// ========================================================
-// Mode
-// ========================================================
-
-function modeInfo(
-    mode
-){
-
-    if(
-        mode ===
-        "scheduled"
-    ){
-
-        return [
-            "🟠 กำลังนับถอยหลัง",
-            "scheduled"
-        ];
-
-    }
-
-    if(
-        mode ===
-        "closed"
-    ){
-
-        return [
-            "🔴 ปิดเซิร์ฟเวอร์",
-            "closed"
-        ];
-
-    }
-
-    return [
-        "🟢 เปิดให้บริการ",
-        "open"
-    ];
-
-}
-
-
-// ========================================================
-// Status Rendering
-// ========================================================
-
-function renderStatus(
-    states
-){
-
-    statesCache =
-        Array.isArray(
-            states
-        )
-        ? states
-        : [];
-
-    const list =
-        $("statusList");
-
-    if(
-        !statesCache.length
-    ){
-
-        list.innerHTML =
-            `
-            <div class="status">
-                ไม่พบข้อมูลสถานะ
-            </div>
-            `;
-
-        return;
-
-    }
-
-
-    const now =
-        currentServerTime();
-
-
-    list.innerHTML =
-        statesCache.map(
-            item => {
-
-                const [
-                    label,
-                    cls
-                ] =
-                    modeInfo(
-                        item.mode
-                    );
-
-
-                let timer =
-                    "เปิดอยู่";
-
-                let progress =
-                    0;
-
-
-                if(
-                    item.mode ===
-                    "scheduled"
-                    &&
-                    item.deadline
-                ){
-
-                    const remaining =
-                        Math.max(
-                            0,
-                            Number(
-                                item.deadline
-                            )
-                            -
-                            now
-                        );
-
-                    const total =
-                        Math.max(
-                            1,
-                            Number(
-                                item.seconds
-                                || 60
-                            )
-                        );
-
-                    const elapsed =
-                        Math.min(
-                            total,
-                            Math.max(
-                                0,
-                                total
-                                -
-                                remaining
-                            )
-                        );
-
-                    progress =
-                        Math.min(
-                            100,
-                            (
-                                elapsed
-                                /
-                                total
-                            )
-                            *
-                            100
-                        );
-
-                    timer =
-                        fmtDuration(
-                            remaining
-                        );
-
-                }
-                else if(
-                    item.mode ===
-                    "closed"
-                ){
-
-                    timer =
-                        "ปิดแล้ว";
-
-                }
-
-
-                const displayName =
-                    item.name
-                    ||
-                    item.placeId
-                    ||
-                    "-";
-
-
-                return `
-                <div
-                    class="status ${cls}"
-                >
-
-                    <div class="status-head">
-
-                        <strong>
-                            ${escapeHtml(
-                                displayName
-                            )}
-                        </strong>
-
-                        <span
-                            class="badge ${cls}"
-                        >
-                            ${label}
-                        </span>
-
-                    </div>
-
-                    <div class="big">
-                        สถานะปัจจุบัน
-                    </div>
-
-                    <div
-                        class="timer"
-                        data-timer-place="${escapeHtml(
-                            item.placeId
-                        )}"
-                    >
-                        ${timer}
-                    </div>
-
-
-                    ${
-                        item.mode ===
-                        "scheduled"
-                        ?
-                        `
-                        <div class="progress">
-
-                            <div
-                                style="
-                                    width:${progress}%
-                                "
-                            ></div>
-
-                        </div>
-                        `
-                        :
-                        ""
-                    }
-
-
-                    <div class="details">
-
-                        <div class="detail">
-
-                            <b>
-                                PLACE ID
-                            </b>
-
-                            <span>
-                                ${escapeHtml(
-                                    item.placeId
-                                )}
-                            </span>
-
-                        </div>
-
-
-                        <div class="detail">
-
-                            <b>
-                                เริ่มคำสั่ง
-                            </b>
-
-                            <span>
-                                ${fmtClock(
-                                    item.commandStartedAt
-                                    ||
-                                    item.startedAt
-                                )}
-                            </span>
-
-                        </div>
-
-
-                        <div class="detail">
-
-                            <b>
-                                DEADLINE
-                            </b>
-
-                            <span>
-                                ${fmtClock(
-                                    item.deadline
-                                )}
-                            </span>
-
-                        </div>
-
-
-                        <div class="detail">
-
-                            <b>
-                                ระยะเวลา
-                            </b>
-
-                            <span>
-                                ${fmtDuration(
-                                    item.seconds
-                                )}
-                            </span>
-
-                        </div>
-
-
-                        <div class="detail">
-
-                            <b>
-                                เหลือเวลา
-                            </b>
-
-                            <span>
-                                ${
-                                    item.mode ===
-                                    "scheduled"
-                                    ?
-                                    fmtDuration(
-                                        Math.max(
-                                            0,
-                                            Number(
-                                                item.deadline
-                                            )
-                                            -
-                                            now
-                                        )
-                                    )
-                                    :
-                                    "00:00:00"
-                                }
-                            </span>
-
-                        </div>
-
-
-                        <div class="detail">
-
-                            <b>
-                                ผ่านไปแล้ว
-                            </b>
-
-                            <span>
-                                ${fmtDuration(
-                                    item.elapsed
-                                    || 0
-                                )}
-                            </span>
-
-                        </div>
-
-                    </div>
-
-
-                    <div class="reason">
-
-                        📝
-                        ${escapeHtml(
-                            item.reason
-                        )}
-
-                    </div>
-
-                </div>
-                `;
-
-            }
-        ).join("");
-
-}
-
-
-// ========================================================
-// Local Countdown
-// ========================================================
-
-function updateTimers(){
-
-    const now =
-        currentServerTime();
-
-
-    statesCache.forEach(
-        item => {
-
-            if(
-                item.mode !==
-                "scheduled"
-                ||
-                !item.deadline
-            ){
-
-                return;
-
-            }
-
-
-            const selector =
-                `[data-timer-place="${CSS.escape(
-                    String(
-                        item.placeId
-                    )
-                )}"]`;
-
-
-            const element =
-                document.querySelector(
-                    selector
-                );
-
-
-            if(!element){
-                return;
-            }
-
-
-            const remaining =
-                Math.max(
-                    0,
-                    Number(
-                        item.deadline
-                    )
-                    -
-                    now
-                );
-
-
-            element.textContent =
-                fmtDuration(
-                    remaining
-                );
-
-        }
-    );
-
-}
-
-
-// ========================================================
-// System Status
-// ========================================================
-
-function updateSystemStatus(
-    data
-){
-
-    const db =
-        $("supabaseStatus");
-
-    const backup =
-        $("backupStatus");
+/* ==========================================================
+   Badge
+   ========================================================== */
+
+function updateBadge(state) {
 
     const badge =
-        $("dbBadge");
+        document.getElementById(
+            "stateBadge"
+        );
 
-
-    if(
-        data.dbAvailable
-    ){
-
-        db.textContent =
-            "● เชื่อมต่อปกติ";
-
-        db.className =
-            "system-value ok";
+    if (state.mode === "open") {
 
         badge.textContent =
-            "● DATABASE OK";
+            "● OPEN";
 
         badge.className =
-            "badge";
+            "badge online";
 
     }
-    else{
 
-        db.textContent =
-            "● Supabase Offline";
-
-        db.className =
-            "system-value off";
+    else if (
+        state.mode === "scheduled"
+    ) {
 
         badge.textContent =
-            "● DATABASE OFFLINE";
+            "● COUNTDOWN";
 
         badge.className =
-            "badge closed";
+            "badge warn";
 
     }
 
+    else {
 
-    if(
-        data.backupAvailable
-    ){
+        badge.textContent =
+            "● CLOSED";
 
-        backup.textContent =
-            "● Backup พร้อมใช้";
-
-        backup.className =
-            "system-value ok";
-
+        badge.className =
+            "badge offline";
     }
-    else{
-
-        backup.textContent =
-            "● Backup ไม่พร้อม";
-
-        backup.className =
-            "system-value off";
-
-    }
-
 }
 
 
-// ========================================================
-// Load Dashboard Status
-// ========================================================
+/* ==========================================================
+   Render Selected State
+   ========================================================== */
 
-let statusLoading = false;
+function renderSelected(
+    state
+) {
 
-
-async function loadStatus(){
-
-    if(statusLoading){
+    if (!state) {
         return;
     }
 
-    statusLoading = true;
+    selectedPlaceId =
+        mapSelect.value;
 
-    try{
+    updateBadge(state);
+
+    document.getElementById(
+        "reasonPreview"
+    ).textContent =
+        state.reason || "-";
+
+
+    document.getElementById(
+        "currentStatus"
+    ).textContent =
+        state.mode;
+
+
+    /*
+       IMPORTANT:
+
+       ถ้าผู้ใช้กำลังพิมพ์อยู่
+       ห้าม Auto Refresh เอาค่าเก่ามาทับ
+    */
+
+    if (!inputDirty && !isSaving) {
+
+        reasonInput.value =
+            state.reason || "";
+
+        secondsInput.value =
+            state.seconds || 60;
+    }
+
+
+    const timer =
+        document.getElementById(
+            "timerDisplay"
+        );
+
+
+    if (
+        state.mode === "scheduled"
+    ) {
+
+        const remaining =
+            Number(
+                state.remaining || 0
+            );
+
+        timer.textContent =
+            "เหลือ " +
+            formatSeconds(
+                remaining
+            );
+
+    }
+
+    else if (
+        state.mode === "closed"
+    ) {
+
+        timer.textContent =
+            "เซิร์ฟเวอร์ปิดอยู่";
+
+    }
+
+    else {
+
+        timer.textContent =
+            "เซิร์ฟเวอร์เปิดอยู่";
+    }
+}
+
+
+/* ==========================================================
+   Load Status
+   ========================================================== */
+
+async function loadStatus() {
+
+    try {
 
         const data =
             await api(
-                "/api/status?_="
-                +
-                Date.now()
+                "/api/status"
             );
 
 
-        const serverNow =
-            Number(
-                data.serverNow
-            ) * 1000;
+        document.getElementById(
+            "dbStatus"
+        ).textContent =
+            data.dbAvailable
+                ? "🟢 Connected"
+                : "🔴 Offline";
 
 
-        if(
-            Number.isFinite(
-                serverNow
-            )
-        ){
+        document.getElementById(
+            "backupStatus"
+        ).textContent =
+            data.backupAvailable
+                ? "🟢 Ready"
+                : "🟡 Unavailable";
 
-            serverOffsetMs =
-                serverNow
-                -
-                Date.now();
+
+        for (
+            const state
+            of data.states
+        ) {
+
+            stateCache[
+                state.placeId
+            ] = state;
 
         }
 
 
-        updateSystemStatus(
-            data
-        );
-
-        renderStatus(
-            data.states
-        );
-
-    }
-    catch(error){
-
-        console.error(
-            error
-        );
-
-    }
-    finally{
-
-        statusLoading = false;
-
-    }
-
-}
-
-
-// ========================================================
-// Load Selected Map
-// ========================================================
-
-async function loadSelected(){
-
-    const selected =
-        $("mapSelect").value;
-
-
-    if(
-        selected ===
-        "ALL"
-    ){
-
-        $("reasonInput").value =
-            "";
-
-        $("secondsInput").value =
-            "60";
-
-        return;
-
-    }
-
-
-    try{
-
-        const data =
-            await api(
-                "/api/state/"
-                +
-                encodeURIComponent(
-                    selected
-                )
-                +
-                "?_="
-                +
-                Date.now()
-            );
-
-
-        $("reasonInput").value =
-            data.state.reason
-            ||
-            "";
-
-        $("secondsInput").value =
-            data.state.seconds
-            ||
-            60;
-
-    }
-    catch(error){
-
-        notify(
-            "โหลดข้อมูลแมพไม่สำเร็จ: "
-            +
-            error.message,
+        loadSelected(
             false
         );
 
     }
 
+    catch (error) {
+
+        document.getElementById(
+            "dbStatus"
+        ).textContent =
+            "🔴 Error";
+
+        setSaveStatus(
+            error.message,
+            "error"
+        );
+    }
 }
 
 
-// ========================================================
-// Read Form
-// ========================================================
+/* ==========================================================
+   Load Selected
+   ========================================================== */
 
-function readForm(){
+function loadSelected(
+    clearDirtyState = true
+) {
 
-    const reason =
-        $("reasonInput")
-            .value
-            .trim();
+    const pid =
+        mapSelect.value;
 
+    selectedPlaceId =
+        pid;
 
-    const rawSeconds =
-        $("secondsInput")
-            .value
-            .trim();
+    /*
+       เมื่อเปลี่ยนแมพ
+       ให้โหลดข้อมูลของแมพใหม่
+       ไม่ใช่ข้อมูลเก่าของแมพเดิม
+    */
 
+    if (clearDirtyState) {
 
-    if(
-        !/^\d+$/.test(
-            rawSeconds
-        )
-    ){
-
-        throw new Error(
-            "เวลาต้องเป็นตัวเลขจำนวนเต็ม"
-        );
+        clearDirty();
 
     }
 
+    const state =
+        stateCache[pid];
+
+    if (state) {
+
+        renderSelected(
+            state
+        );
+
+    }
+}
+
+
+/* ==========================================================
+   Save Config
+   ========================================================== */
+
+async function saveConfig() {
+
+    if (isSaving) {
+        return;
+    }
+
+    const placeId =
+        mapSelect.value;
+
+    const reason =
+        reasonInput.value;
 
     const seconds =
         Number(
-            rawSeconds
+            secondsInput.value
         );
 
 
-    if(
-        !Number.isInteger(
-            seconds
-        )
+    if (
+        !Number.isInteger(seconds)
         ||
         seconds < 1
         ||
         seconds > 86400
-    ){
+    ) {
 
-        throw new Error(
-            "เวลาต้องอยู่ระหว่าง 1 - 86400 วินาที"
+        setSaveStatus(
+            "เวลา Countdown ต้องอยู่ระหว่าง 1-86400 วินาที",
+            "error"
+        );
+
+        return;
+    }
+
+
+    isSaving = true;
+
+    saveConfigButton.disabled =
+        true;
+
+    setSaveStatus(
+        "⏳ กำลังบันทึกและตรวจสอบกับ Supabase...",
+        "info"
+    );
+
+
+    try {
+
+        const data =
+            await api(
+                "/api/save-config",
+                {
+                    method: "POST",
+
+                    body: JSON.stringify({
+                        scope: "place",
+
+                        place_id:
+                            placeId,
+
+                        reason:
+                            reason,
+
+                        seconds:
+                            seconds
+                    })
+                }
+            );
+
+
+        /*
+           Server ยืนยันแล้วว่า
+           DB มีค่าตรงกับที่ส่ง
+        */
+
+        const savedState =
+            data.state;
+
+
+        stateCache[
+            placeId
+        ] = savedState;
+
+
+        /*
+           ตอนนี้ค่อยเอาค่า Server
+           มาใส่กลับใน input
+        */
+
+        reasonInput.value =
+            savedState.reason;
+
+        secondsInput.value =
+            savedState.seconds;
+
+
+        clearDirty();
+
+
+        renderSelected(
+            savedState
+        );
+
+
+        setSaveStatus(
+            "✅ บันทึกสำเร็จ และตรวจสอบข้อมูลใน Supabase แล้ว",
+            "success"
         );
 
     }
 
+    catch (error) {
 
-    return {
-        reason,
-        seconds
-    };
+        /*
+           สำคัญ:
+           ถ้า Save ไม่สำเร็จ
+           ไม่เอาค่าเก่ามาทับช่องที่ผู้ใช้กำลังแก้
+        */
 
+        setSaveStatus(
+            "❌ " + error.message,
+            "error"
+        );
+
+    }
+
+    finally {
+
+        isSaving = false;
+
+        saveConfigButton.disabled =
+            false;
+    }
 }
 
 
-// ========================================================
-// Selected Action
-// ========================================================
+/* ==========================================================
+   Selected Action
+   ========================================================== */
 
 async function actionSelected(
     mode
-){
+) {
 
-    if(busy){
-        return;
-    }
+    const placeId =
+        mapSelect.value;
+
+    const reason =
+        reasonInput.value;
+
+    const seconds =
+        Number(
+            secondsInput.value
+        );
 
 
-    const selected =
-        $("mapSelect").value;
+    if (
+        !Number.isInteger(seconds)
+        ||
+        seconds < 1
+        ||
+        seconds > 86400
+    ) {
 
-
-    if(
-        selected ===
-        "ALL"
-    ){
-
-        notify(
-            "กรุณาเลือกแมพก่อน",
-            false
+        setSaveStatus(
+            "เวลา Countdown ไม่ถูกต้อง",
+            "error"
         );
 
         return;
-
     }
 
 
-    try{
-
-        const form =
-            readForm();
-
-
-        if(
-            mode ===
-            "scheduled"
-            &&
-            !$("timerEnabled").checked
-        ){
-
-            mode =
-                "closed";
-
-        }
+    setSaveStatus(
+        "⏳ กำลังเปลี่ยนสถานะ...",
+        "info"
+    );
 
 
-        setBusy(true);
+    try {
+
+        const data =
+            await api(
+                "/api/update",
+                {
+                    method: "POST",
+
+                    body: JSON.stringify({
+                        place_id:
+                            placeId,
+
+                        mode:
+                            mode,
+
+                        reason:
+                            reason,
+
+                        seconds:
+                            seconds
+                    })
+                }
+            );
 
 
-        await api(
-            "/api/update",
-            {
-                method:"POST",
-                body:JSON.stringify({
-                    place_id:selected,
-                    mode:mode,
-                    reason:form.reason,
-                    seconds:form.seconds
-                })
-            }
+        stateCache[
+            placeId
+        ] =
+            data.state;
+
+
+        reasonInput.value =
+            data.state.reason;
+
+        secondsInput.value =
+            data.state.seconds;
+
+
+        clearDirty();
+
+
+        renderSelected(
+            data.state
         );
 
 
-        notify(
-            "บันทึกคำสั่งสำเร็จ ✅"
-        );
-
-
-        await loadStatus();
-
-    }
-    catch(error){
-
-        notify(
-            error.message,
-            false
+        setSaveStatus(
+            "✅ เปลี่ยนสถานะและบันทึกข้อมูลสำเร็จ",
+            "success"
         );
 
     }
-    finally{
 
-        setBusy(false);
+    catch (error) {
 
+        setSaveStatus(
+            "❌ " + error.message,
+            "error"
+        );
     }
-
 }
 
 
-// ========================================================
-// All Action
-// ========================================================
+/* ==========================================================
+   All Actions
+   ========================================================== */
 
 async function actionAll(
     mode
-){
+) {
 
-    if(busy){
+    const reason =
+        reasonInput.value;
+
+    const seconds =
+        Number(
+            secondsInput.value
+        );
+
+
+    if (
+        !Number.isInteger(seconds)
+        ||
+        seconds < 1
+        ||
+        seconds > 86400
+    ) {
+
+        setSaveStatus(
+            "เวลา Countdown ไม่ถูกต้อง",
+            "error"
+        );
+
         return;
     }
 
 
-    try{
-
-        const form =
-            readForm();
-
-
-        if(
-            mode ===
-            "scheduled"
-            &&
-            !$("timerEnabled").checked
-        ){
-
-            mode =
-                "closed";
-
-        }
+    setSaveStatus(
+        "⏳ กำลังอัปเดตทุกแมพ...",
+        "info"
+    );
 
 
-        setBusy(true);
-
+    try {
 
         const data =
             await api(
                 "/api/update-all",
                 {
-                    method:"POST",
-                    body:JSON.stringify({
-                        mode:mode,
-                        reason:form.reason,
-                        seconds:form.seconds
+                    method: "POST",
+
+                    body: JSON.stringify({
+                        mode:
+                            mode,
+
+                        reason:
+                            reason,
+
+                        seconds:
+                            seconds
                     })
                 }
             );
 
 
-        if(
-            data.failed
-            &&
-            data.failed > 0
-        ){
+        let failed = 0;
 
-            notify(
-                `ดำเนินการบางแมพไม่สำเร็จ (${data.failed})`,
-                false
+
+        for (
+            const result
+            of data.results
+        ) {
+
+            if (
+                result.ok
+            ) {
+
+                stateCache[
+                    result.placeId
+                ] =
+                    result.state;
+
+            }
+
+            else {
+
+                failed++;
+            }
+        }
+
+
+        const current =
+            stateCache[
+                mapSelect.value
+            ];
+
+
+        if (current) {
+
+            renderSelected(
+                current
+            );
+        }
+
+
+        clearDirty();
+
+
+        if (failed === 0) {
+
+            setSaveStatus(
+                "✅ อัปเดตทุกแมพสำเร็จ",
+                "success"
             );
 
         }
-        else{
 
-            notify(
-                "บันทึกคำสั่งทุกแมพสำเร็จ ✅"
+        else {
+
+            setSaveStatus(
+                "⚠️ สำเร็จบางแมพ แต่มี " +
+                failed +
+                " แมพที่ล้มเหลว",
+                "error"
             );
-
         }
-
-
-        await loadStatus();
 
     }
-    catch(error){
 
-        notify(
-            error.message,
-            false
+    catch (error) {
+
+        setSaveStatus(
+            "❌ " + error.message,
+            "error"
         );
-
     }
-    finally{
-
-        setBusy(false);
-
-    }
-
 }
 
 
-// ========================================================
-// Save Config
-// ========================================================
+/* ==========================================================
+   Reveal Token
+   ========================================================== */
 
-async function saveConfig(){
-
-    if(busy){
-        return;
-    }
-
-
-    try{
-
-        const selected =
-            $("mapSelect").value;
-
-        const form =
-            readForm();
-
-
-        setBusy(true);
-
-
-        if(
-            selected ===
-            "ALL"
-        ){
-
-            await api(
-                "/api/save-config",
-                {
-                    method:"POST",
-                    body:JSON.stringify({
-                        scope:"all",
-                        reason:form.reason,
-                        seconds:form.seconds
-                    })
-                }
-            );
-
-        }
-        else{
-
-            await api(
-                "/api/save-config",
-                {
-                    method:"POST",
-                    body:JSON.stringify({
-                        scope:"place",
-                        place_id:selected,
-                        reason:form.reason,
-                        seconds:form.seconds
-                    })
-                }
-            );
-
-        }
-
-
-        notify(
-            "บันทึกข้อความและเวลาแล้ว ✅"
-        );
-
-
-        await loadStatus();
-
-    }
-    catch(error){
-
-        notify(
-            error.message,
-            false
-        );
-
-    }
-    finally{
-
-        setBusy(false);
-
-    }
-
-}
-
-
-// ========================================================
-// Reveal Token
-// ========================================================
-
-async function revealToken(){
-
-    if(busy){
-        return;
-    }
-
-
-    if(tokenVisible){
-
-        $("tokenDisplay")
-            .textContent =
-            "••••••••••••••••••••••••••••••••";
-
-        tokenVisible =
-            false;
-
-        $("revealButton")
-            .textContent =
-            "👁️ ดู Token";
-
-        return;
-
-    }
-
+async function revealToken() {
 
     const pin =
-        $("pinInput").value;
+        document.getElementById(
+            "pinInput"
+        ).value;
 
 
-    if(!pin){
+    if (!pin) {
 
-        notify(
+        setSaveStatus(
             "กรุณากรอก Token PIN",
-            false
+            "error"
         );
 
         return;
-
     }
 
 
-    try{
-
-        setBusy(true);
-
+    try {
 
         const data =
             await api(
                 "/api/token/reveal",
                 {
-                    method:"POST",
-                    body:JSON.stringify({
-                        pin:pin
+                    method: "POST",
+
+                    body: JSON.stringify({
+                        pin: pin
                     })
                 }
             );
 
 
-        // Token is received only now.
-        // It is NOT inside initial HTML.
+        const box =
+            document.getElementById(
+                "tokenBox"
+            );
 
-        $("tokenDisplay")
-            .textContent =
+
+        box.textContent =
             data.token;
 
-
-        tokenVisible =
-            true;
-
-
-        $("revealButton")
-            .textContent =
-            "🙈 ซ่อน Token";
+        box.style.display =
+            "block";
 
 
-        $("pinInput").value =
-            "";
-
-
-        notify(
-            "ยืนยัน PIN สำเร็จ"
+        setSaveStatus(
+            "✅ ยืนยัน PIN สำเร็จ",
+            "success"
         );
 
     }
-    catch(error){
 
-        $("tokenDisplay")
-            .textContent =
-            "••••••••••••••••••••••••••••••••";
+    catch (error) {
 
-        tokenVisible =
-            false;
-
-        notify(
-            error.message,
-            false
+        setSaveStatus(
+            "❌ " + error.message,
+            "error"
         );
-
     }
-    finally{
-
-        setBusy(false);
-
-    }
-
 }
 
 
-// ========================================================
-// Regenerate Token
-// ========================================================
+/* ==========================================================
+   New Token
+   ========================================================== */
 
-async function newToken(){
-
-    if(busy){
-        return;
-    }
-
+async function newToken() {
 
     const pin =
-        $("pinInput").value;
+        document.getElementById(
+            "pinInput"
+        ).value;
 
 
-    if(!pin){
+    if (!pin) {
 
-        notify(
-            "กรุณากรอก Token PIN ก่อนสร้าง Token ใหม่",
-            false
+        setSaveStatus(
+            "กรุณากรอก Token PIN",
+            "error"
         );
 
         return;
-
     }
 
 
-    if(
+    if (
         !confirm(
-            "สร้าง Token ใหม่จริงหรือไม่?\n\n"
-            +
-            "Token เดิมจะใช้งานไม่ได้อีก"
+            "ต้องการสร้าง Token ใหม่จริงหรือไม่?\n\nToken เดิมจะใช้งานไม่ได้"
         )
-    ){
+    ) {
 
         return;
-
     }
 
 
-    try{
-
-        setBusy(true);
-
+    try {
 
         const data =
             await api(
                 "/api/token/regenerate",
                 {
-                    method:"POST",
-                    body:JSON.stringify({
-                        pin:pin
+                    method: "POST",
+
+                    body: JSON.stringify({
+                        pin: pin
                     })
                 }
             );
 
 
-        $("tokenDisplay")
-            .textContent =
+        const box =
+            document.getElementById(
+                "tokenBox"
+            );
+
+
+        box.textContent =
             data.token;
 
-
-        $("pinInput").value =
-            "";
-
-
-        tokenVisible =
-            true;
+        box.style.display =
+            "block";
 
 
-        $("revealButton")
-            .textContent =
-            "🙈 ซ่อน Token";
-
-
-        notify(
-            "สร้าง Token ใหม่สำเร็จและบันทึกแล้ว ✅"
+        setSaveStatus(
+            "✅ สร้าง Token ใหม่สำเร็จ",
+            "success"
         );
 
     }
-    catch(error){
 
-        notify(
-            error.message,
-            false
+    catch (error) {
+
+        setSaveStatus(
+            "❌ " + error.message,
+            "error"
         );
-
     }
-    finally{
-
-        setBusy(false);
-
-    }
-
 }
 
 
-// ========================================================
-// Auto Refresh
-// ========================================================
+/* ==========================================================
+   Automatic Refresh
+   ========================================================== */
 
-setInterval(
-    loadStatus,
-    2000
-);
+refreshTimer =
+    setInterval(
+        async function() {
+
+            /*
+               ถ้ากำลัง Save
+               ห้าม refresh มาแทรก
+            */
+
+            if (isSaving) {
+                return;
+            }
+
+            await loadStatus();
+
+        },
+        2000
+    );
 
 
-// ========================================================
-// Local Timer Refresh
-// ========================================================
-
-setInterval(
-    updateTimers,
-    250
-);
-
-
-// ========================================================
-// Initial
-// ========================================================
+/* ==========================================================
+   Initial Load
+   ========================================================== */
 
 loadStatus();
 
@@ -4470,15 +4358,32 @@ def api_status():
 
     return jsonify({
         "ok": True,
+
         "serverNow": time.time(),
-        "dbAvailable": DB_AVAILABLE,
-        "backupAvailable": BACKUP_AVAILABLE,
-        "lastDbSync": LAST_DB_SYNC,
-        "lastDbError": LAST_DB_ERROR,
-        "lastBackupSave": LAST_BACKUP_SAVE,
-        "lastBackupError": LAST_BACKUP_ERROR,
-        "initialized": INITIALIZED,
-        "states": states,
+
+        "dbAvailable":
+            DB_AVAILABLE,
+
+        "backupAvailable":
+            BACKUP_AVAILABLE,
+
+        "lastDbSync":
+            LAST_DB_SYNC,
+
+        "lastDbError":
+            LAST_DB_ERROR,
+
+        "lastBackupSave":
+            LAST_BACKUP_SAVE,
+
+        "lastBackupError":
+            LAST_BACKUP_ERROR,
+
+        "initialized":
+            INITIALIZED,
+
+        "states":
+            states,
     })
 
 
@@ -4504,10 +4409,14 @@ def api_state(
 
     return jsonify({
         "ok": True,
-        "serverNow": time.time(),
-        "state": snapshot(
-            place_id
-        ),
+
+        "serverNow":
+            time.time(),
+
+        "state":
+            snapshot(
+                place_id
+            ),
     })
 
 
@@ -4535,13 +4444,26 @@ def roblox_state(
     )
 
     return jsonify({
-        "mode": state["mode"],
-        "reason": state["reason"],
-        "deadline": state["deadline"],
-        "seconds": state["seconds"],
-        "serverNow": state["serverNow"],
-        "remaining": state["remaining"],
-        "elapsed": state["elapsed"],
+        "mode":
+            state["mode"],
+
+        "reason":
+            state["reason"],
+
+        "deadline":
+            state["deadline"],
+
+        "seconds":
+            state["seconds"],
+
+        "serverNow":
+            state["serverNow"],
+
+        "remaining":
+            state["remaining"],
+
+        "elapsed":
+            state["elapsed"],
     })
 
 
@@ -4579,13 +4501,11 @@ def api_update():
             "seconds"
         )
 
-
         if place_id not in PLACE_IDS:
 
             raise ValueError(
                 "ไม่พบ Place ID นี้"
             )
-
 
         if mode not in {
             "open",
@@ -4597,7 +4517,6 @@ def api_update():
                 "สถานะไม่ถูกต้อง"
             )
 
-
         result = update_state(
             place_id,
             mode=mode,
@@ -4605,12 +4524,10 @@ def api_update():
             seconds=seconds,
         )
 
-
         return jsonify({
             "ok": True,
             "state": result,
         })
-
 
     except Exception as exc:
 
@@ -4652,20 +4569,22 @@ def api_update_all():
             "seconds"
         )
 
-
         result = update_all(
             mode,
             reason=reason,
             seconds=seconds,
         )
 
-
         return jsonify({
-            "ok": result["success"],
-            "results": result["results"],
-            "failed": result["failed"],
-        })
+            "ok":
+                result["success"],
 
+            "results":
+                result["results"],
+
+            "failed":
+                result["failed"],
+        })
 
     except Exception as exc:
 
@@ -4682,6 +4601,12 @@ def api_update_all():
 
 # ============================================================
 # API Save Config
+#
+# ใช้สำหรับ:
+# - reason
+# - seconds
+#
+# โดยไม่เปลี่ยน mode
 # ============================================================
 
 @app.route(
@@ -4727,18 +4652,30 @@ def api_save_config():
                     with LOCK:
 
                         current = copy.deepcopy(
-                            DATA["places"][pid]
+                            DATA[
+                                "places"
+                            ][pid]
                         )
 
                     new_state = clean_state({
                         **current,
-                        "reason": reason,
-                        "seconds": seconds,
+
+                        "reason":
+                            reason,
+
+                        "seconds":
+                            seconds,
                     })
 
-                    ok, error = save_with_retry(
-                        pid,
-                        new_state,
+                    # ----------------------------------------
+                    # DB FIRST
+                    # ----------------------------------------
+
+                    ok, error, _ = (
+                        save_with_retry(
+                            pid,
+                            new_state,
+                        )
                     )
 
                     if not ok:
@@ -4748,9 +4685,34 @@ def api_save_config():
                             f"{error}"
                         )
 
+                    # ----------------------------------------
+                    # Verify DB
+                    # ----------------------------------------
+
+                    verified, verify_error = (
+                        verify_database_state(
+                            pid,
+                            new_state,
+                        )
+                    )
+
+                    if not verified:
+
+                        raise RuntimeError(
+                            f"{pid}: "
+                            f"ตรวจสอบหลังบันทึกไม่ผ่าน: "
+                            f"{verify_error}"
+                        )
+
+                    # ----------------------------------------
+                    # DB verified -> RAM
+                    # ----------------------------------------
+
                     with LOCK:
 
-                        DATA["places"][pid] = (
+                        DATA[
+                            "places"
+                        ][pid] = (
                             copy.deepcopy(
                                 new_state
                             )
@@ -4760,11 +4722,14 @@ def api_save_config():
                     snapshot(pid)
                 )
 
+            # Backup only after all DB saves
             save_local_backup()
 
             return jsonify({
                 "ok": True,
-                "results": results,
+
+                "results":
+                    results,
             })
 
 
@@ -4792,13 +4757,25 @@ def api_save_config():
             with LOCK:
 
                 current = copy.deepcopy(
-                    DATA["places"][place_id]
+                    DATA[
+                        "places"
+                    ][place_id]
                 )
+
+            # ------------------------------------------------
+            # สำคัญ:
+            # เปลี่ยนเฉพาะ reason + seconds
+            # mode / deadline ไม่แตะ
+            # ------------------------------------------------
 
             new_state = clean_state({
                 **current,
-                "reason": reason,
-                "seconds": seconds,
+
+                "reason":
+                    reason,
+
+                "seconds":
+                    seconds,
             })
 
 
@@ -4806,9 +4783,11 @@ def api_save_config():
             # DB FIRST
             # ------------------------------------------------
 
-            ok, error = save_with_retry(
-                place_id,
-                new_state,
+            ok, error, _ = (
+                save_with_retry(
+                    place_id,
+                    new_state,
+                )
             )
 
 
@@ -4821,26 +4800,77 @@ def api_save_config():
 
 
             # ------------------------------------------------
-            # DB success -> RAM
+            # Verify DB
+            # ------------------------------------------------
+
+            verified, verify_error = (
+                verify_database_state(
+                    place_id,
+                    new_state,
+                )
+            )
+
+
+            if not verified:
+
+                raise RuntimeError(
+                    "บันทึกแล้ว แต่ข้อมูลใน "
+                    "Supabase ไม่ตรงกับค่าที่ส่ง: "
+                    + str(verify_error)
+                )
+
+
+            # ------------------------------------------------
+            # DB verified -> RAM
             # ------------------------------------------------
 
             with LOCK:
 
-                DATA["places"][place_id] = (
+                DATA[
+                    "places"
+                ][place_id] = (
                     copy.deepcopy(
                         new_state
                     )
                 )
 
 
-        save_local_backup()
+        # ----------------------------------------------------
+        # Backup
+        # ----------------------------------------------------
+
+        backup_ok, backup_error = (
+            save_local_backup()
+        )
+
+        if not backup_ok:
+
+            LOG.warning(
+                "DB saved but backup failed: %s",
+                backup_error,
+            )
+
+
+        # ----------------------------------------------------
+        # Return verified state
+        # ----------------------------------------------------
+
+        final_state = snapshot(
+            place_id
+        )
 
 
         return jsonify({
             "ok": True,
-            "state": snapshot(
-                place_id
-            ),
+
+            "state":
+                final_state,
+
+            "databaseVerified":
+                True,
+
+            "backupAvailable":
+                BACKUP_AVAILABLE,
         })
 
 
@@ -4886,6 +4916,7 @@ def api_token_reveal():
 
             return jsonify({
                 "ok": False,
+
                 "error":
                     "Token PIN ไม่ถูกต้อง",
             }), 403
@@ -4954,24 +4985,17 @@ def api_token_reveal():
 
             return jsonify({
                 "ok": False,
+
                 "error":
                     "ไม่พบ Token ในระบบ",
             }), 500
 
 
-        # IMPORTANT:
-        #
-        # Token is NOT in:
-        # - HTML
-        # - initial JavaScript
-        # - Flask session
-        #
-        # It is returned ONLY after PIN verification.
-        #
-
         return jsonify({
             "ok": True,
-            "token": token,
+
+            "token":
+                token,
         })
 
 
@@ -4984,7 +5008,9 @@ def api_token_reveal():
 
         return jsonify({
             "ok": False,
-            "error": str(exc),
+
+            "error":
+                str(exc),
         }), 400
 
 
@@ -5017,6 +5043,7 @@ def api_token_regenerate():
 
             return jsonify({
                 "ok": False,
+
                 "error":
                     "Token PIN ไม่ถูกต้อง",
             }), 403
@@ -5027,34 +5054,65 @@ def api_token_regenerate():
         )
 
 
-        # ----------------------------------------------------
-        # Save new token FIRST
-        # ----------------------------------------------------
+        with WRITE_LOCK:
 
-        ok, error = save_with_retry(
-            SYSTEM_TOKEN_ID,
-            {
-                "token": new_token,
-            },
-        )
+            # ------------------------------------------------
+            # Save FIRST
+            # ------------------------------------------------
 
-
-        if not ok:
-
-            raise RuntimeError(
-                "บันทึก Token ใหม่ใน Supabase "
-                "ไม่สำเร็จ: "
-                + str(error)
+            ok, error, _ = (
+                save_with_retry(
+                    SYSTEM_TOKEN_ID,
+                    {
+                        "token":
+                            new_token,
+                    },
+                )
             )
 
 
-        # ----------------------------------------------------
-        # Supabase success -> RAM
-        # ----------------------------------------------------
+            if not ok:
 
-        with LOCK:
+                raise RuntimeError(
+                    "บันทึก Token ใหม่ใน Supabase "
+                    "ไม่สำเร็จ: "
+                    + str(error)
+                )
 
-            DATA["token"] = new_token
+
+            # ------------------------------------------------
+            # Verify
+            # ------------------------------------------------
+
+            verified, verify_error = (
+                verify_database_state(
+                    SYSTEM_TOKEN_ID,
+                    {
+                        "token":
+                            new_token
+                    },
+                )
+            )
+
+
+            if not verified:
+
+                raise RuntimeError(
+                    "Token ถูกบันทึกแต่ "
+                    "ตรวจสอบไม่ผ่าน: "
+                    + str(verify_error)
+                )
+
+
+            # ------------------------------------------------
+            # DB verified -> RAM
+            # ------------------------------------------------
+
+            with LOCK:
+
+                DATA["token"] = (
+                    new_token
+                )
 
 
         # ----------------------------------------------------
@@ -5076,7 +5134,12 @@ def api_token_regenerate():
 
         return jsonify({
             "ok": True,
-            "token": new_token,
+
+            "token":
+                new_token,
+
+            "databaseVerified":
+                True,
         })
 
 
@@ -5089,7 +5152,9 @@ def api_token_regenerate():
 
         return jsonify({
             "ok": False,
-            "error": str(exc),
+
+            "error":
+                str(exc),
         }), 400
 
 
@@ -5105,14 +5170,19 @@ def health():
 
     return jsonify({
         "ok": True,
+
         "service":
             "roblox-control-center",
+
         "database":
             DB_AVAILABLE,
+
         "backup":
             BACKUP_AVAILABLE,
+
         "initialized":
             INITIALIZED,
+
         "serverNow":
             time.time(),
     })
