@@ -64,12 +64,12 @@ def env_required(name: str) -> str:
 ADMIN_PASSWORD = env_required("6155045")
 TOKEN_PIN = env_required("991675788")
 SUPABASE_URL = env_required("https://roiuyoflkmftbxtdeuax.supabase.co").rstrip("/")
-SUPABASE_KEY = env_required("sb_publishable_u3rUgrL7oM5FoolIFy0ocA_MsyiuPoh")
+SUPABASE_KEY = env_required("sb_secret_EvnaRhy6JMuZm0W_TkAZIg_MnepRC9m")
 
 # A stable SECRET_KEY is important for Flask sessions.
 # Generate one locally with:
 # python -c "import secrets; print(secrets.token_hex(32))"
-SECRET_KEY = os.environ.get("SECRET_KEY", "").strip()
+SECRET_KEY = os.environ.get("SECRET_KEY", "846a31776edb467c84a160fd8f9b70d0437850c112bc8bc74a17aaba3b52db30").strip()
 if not SECRET_KEY:
     raise RuntimeError(
         "Missing SECRET_KEY. Add a long random value to Render Environment."
